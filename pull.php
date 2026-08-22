@@ -5,11 +5,20 @@
 //
 // Usage: open https://<your-host>/pull.php in a browser.
 // Append ?plain=1 for unstyled text/plain output (useful for cron / curl).
+// Append ?logout=1 to forget a remembered password on this browser.
+//
+// Optional password gate (set during setup): the password is stored hashed and
+// can be remembered in a cookie. For cron, send it as the X-Pull-Password header.
+// Optional purge: after copying, delete everything that is no longer in the repo.
 
 declare(strict_types=1);
 
 const CONFIG_FILE = 'pull-config.php';
 const ALWAYS_KEEP = ['pull.php', 'pull-config.php'];
+
+const AUTH_COOKIE       = 'pull_auth';
+const AUTH_REMEMBER_TTL = 2592000; // "remember me" cookie lifetime: 30 days
+const AUTH_SESSION_TTL  = 43200;   // without "remember me": 12 hours, session cookie
 
 $configPath = __DIR__ . '/' . CONFIG_FILE;
 $plain      = isset($_GET['plain']);
@@ -49,6 +58,11 @@ if ($denied !== null) {
     header('Content-Type: text/html; charset=utf-8');
     exit("<!doctype html><meta charset=\"utf-8\"><title>403</title><body style=\"background:#1e1e1e;color:#ff6b6b;font-family:monospace;padding:2rem\">"
         . htmlspecialchars($denied, ENT_QUOTES) . "</body>");
+}
+
+// Optional password gate. An empty password_hash means open access.
+if ($config['password_hash'] !== '') {
+    require_auth($config['password_hash'], $plain);
 }
 
 start_output($plain);
@@ -161,10 +175,25 @@ $keep = array_values(array_unique(array_merge(ALWAYS_KEEP, $config['keep_files']
 term("copying into {$target} (preserving: " . implode(', ', $keep) . ")");
 $copied = 0;
 copyTree($src, $target, $keep, $copied);
-cleanup($tmp);
 
 term("copied {$copied} files");
-print_finish_banner($startTs, $startStr, $tz, true, $copied);
+
+// Purge runs only after a successful copy, so a failed download never deletes anything.
+$deleted = null;
+if ($config['purge']) {
+    term("purge: on — deleting everything that is no longer in the repository (irreversible)");
+    $deletedFiles = 0;
+    $deletedDirs  = 0;
+    purgeExtra($src, $target, $keep, $deletedFiles, $deletedDirs);
+    $deleted = $deletedFiles;
+    term("deleted {$deletedFiles} files, {$deletedDirs} directories");
+} else {
+    term("purge: off — files removed from the repository stay on the server");
+}
+
+cleanup($tmp); // only now — purge compares the target against $src
+
+print_finish_banner($startTs, $startStr, $tz, true, $copied, $deleted);
 end_output();
 exit;
 
@@ -220,7 +249,7 @@ function term(string $msg): void {
     flush();
 }
 
-function print_finish_banner(float $startTs, string $startStr, string $tz, bool $ok, int $copied = 0): void {
+function print_finish_banner(float $startTs, string $startStr, string $tz, bool $ok, int $copied = 0, ?int $deleted = null): void {
     $endTs   = microtime(true);
     $endStr  = date('Y-m-d H:i:s');
     $dur     = $endTs - $startTs;
@@ -233,6 +262,9 @@ function print_finish_banner(float $startTs, string $startStr, string $tz, bool 
     term("  DURATION: " . number_format($dur, 2) . " seconds");
     if ($ok) {
         term("  FILES:    {$copied}");
+        if ($deleted !== null) {
+            term("  DELETED:  {$deleted}");
+        }
     }
     term("================================================");
 }
@@ -253,6 +285,10 @@ function load_config(string $path): array {
         'gh_token'   => (string)($raw['gh_token']   ?? ''),
         'keep_files' => is_array($raw['keep_files'] ?? null) ? array_values($raw['keep_files']) : [],
         'timezone'   => (string)($raw['timezone']   ?? 'UTC'),
+        // Both default to "off" when the key is missing, so a config written by an
+        // older version keeps working and never starts deleting files by surprise.
+        'password_hash' => (string)($raw['password_hash'] ?? ''),
+        'purge'         => (bool)($raw['purge'] ?? false),
     ];
 }
 
@@ -323,6 +359,47 @@ function copyTree(string $from, string $to, array $keepTopLevel, int &$copied): 
     }
 }
 
+// Mirror mode: delete everything in $dst that has no counterpart in $src.
+// Top-level names in $keepTopLevel are skipped entirely. Symlinks are never
+// followed — the link itself is removed, whatever it points at stays untouched.
+function purgeExtra(string $src, string $dst, array $keepTopLevel, int &$files, int &$dirs): void {
+    // A missing source would make every target file look obsolete — refuse to delete.
+    if (!is_dir($src) || !is_dir($dst)) return;
+    foreach (new DirectoryIterator($dst) as $f) {
+        if ($f->isDot()) continue;
+        $name = $f->getFilename();
+        if ($keepTopLevel && in_array($name, $keepTopLevel, true)) continue;
+        $d = $f->getPathname();
+        $s = $src . '/' . $name;
+        if ($f->isLink()) {
+            if (!file_exists($s)) { @unlink($d); $files++; }
+            continue;
+        }
+        if ($f->isDir()) {
+            if (is_dir($s)) {
+                purgeExtra($s, $d, [], $files, $dirs);
+            } else {
+                rmTree($d, $files, $dirs);
+            }
+        } elseif (!is_file($s)) {
+            @unlink($d);
+            $files++;
+        }
+    }
+}
+
+function rmTree(string $dir, int &$files, int &$dirs): void {
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($it as $f) {
+        if ($f->isDir() && !$f->isLink()) { @rmdir($f->getPathname()); $dirs++; }
+        else { @unlink($f->getPathname()); $files++; }
+    }
+    if (@rmdir($dir)) $dirs++;
+}
+
 function cleanup(string $dir): void {
     if (!is_dir($dir)) return;
     $it = new RecursiveIteratorIterator(
@@ -335,6 +412,130 @@ function cleanup(string $dir): void {
     @rmdir($dir);
 }
 
+// ---------- password gate ----------
+
+// Returns when the request is authorised; renders the unlock screen and exits otherwise.
+function require_auth(string $hash, bool $plain): void {
+    if (isset($_GET['logout'])) {
+        auth_cookie_clear();
+        if ($plain) {
+            header('Content-Type: text/plain; charset=utf-8');
+            exit("logged out\n");
+        }
+        render_login_form(['logged out — enter the password to continue']);
+        exit;
+    }
+
+    $cookie = (string)($_COOKIE[AUTH_COOKIE] ?? '');
+    if ($cookie !== '' && auth_token_valid($cookie, $hash)) return;
+
+    // Password may also arrive from a form post, a query param, or a header (cron).
+    $supplied = null;
+    foreach ([
+        $_POST['password'] ?? null,
+        $_GET['password'] ?? null,
+        $_SERVER['HTTP_X_PULL_PASSWORD'] ?? null,
+    ] as $candidate) {
+        if (is_string($candidate) && $candidate !== '') { $supplied = $candidate; break; }
+    }
+
+    if ($supplied !== null && password_verify($supplied, $hash)) {
+        auth_cookie_set($hash, isset($_POST['remember']) || isset($_GET['remember']));
+        return;
+    }
+
+    if ($supplied !== null) usleep(400000); // small brake on password guessing
+
+    http_response_code(401);
+    if ($plain) {
+        header('Content-Type: text/plain; charset=utf-8');
+        exit(($supplied !== null ? "unauthorized: wrong password\n" : "unauthorized: password required\n")
+            . "hint: send it as a header, e.g.\n"
+            . "  curl -s -H \"X-Pull-Password: \$PULL_PASSWORD\" \"https://host/pull.php?plain=1\"\n");
+    }
+    render_login_form($supplied !== null ? ['wrong password'] : []);
+    exit;
+}
+
+// Token = expiry + HMAC over it, keyed by the stored password hash. Changing the
+// password changes the hash, which invalidates every cookie handed out before.
+function auth_token(string $hash, int $expires): string {
+    return $expires . '|' . hash_hmac('sha256', 'pull-auth|' . $expires, $hash);
+}
+
+function auth_token_valid(string $token, string $hash): bool {
+    $parts = explode('|', $token, 2);
+    if (count($parts) !== 2) return false;
+    $expires = (int)$parts[0];
+    if ($expires <= time()) return false;
+    return hash_equals(hash_hmac('sha256', 'pull-auth|' . $expires, $hash), $parts[1]);
+}
+
+function auth_cookie_set(string $hash, bool $remember): void {
+    $ttl     = $remember ? AUTH_REMEMBER_TTL : AUTH_SESSION_TTL;
+    $expires = time() + $ttl;
+    setcookie(AUTH_COOKIE, auth_token($hash, $expires), [
+        'expires'  => $remember ? $expires : 0, // 0 = cookie dies with the browser session
+        'path'     => auth_cookie_path(),
+        'secure'   => auth_is_https(),
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+}
+
+function auth_cookie_clear(): void {
+    setcookie(AUTH_COOKIE, '', [
+        'expires'  => time() - 3600,
+        'path'     => auth_cookie_path(),
+        'secure'   => auth_is_https(),
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+}
+
+// Scope the cookie to the directory the script lives in, not the whole host.
+function auth_cookie_path(): string {
+    $dir = str_replace('\\', '/', dirname((string)($_SERVER['SCRIPT_NAME'] ?? '/pull.php')));
+    return ($dir === '' || $dir === '.' || $dir === '/') ? '/' : rtrim($dir, '/') . '/';
+}
+
+function auth_is_https(): bool {
+    if (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off') return true;
+    if ((string)($_SERVER['SERVER_PORT'] ?? '') === '443') return true;
+    return strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+}
+
+function render_login_form(array $errors = []): void {
+    header('Content-Type: text/html; charset=utf-8');
+    echo "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">";
+    echo "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+    echo "<meta name=\"robots\" content=\"noindex,nofollow\">";
+    echo "<title>pull.php — locked</title>";
+    echo terminal_css();
+    echo "</head><body><div class=\"term\"><div class=\"bar\">";
+    echo "<span class=\"dot r\"></span><span class=\"dot y\"></span><span class=\"dot g\"></span>";
+    echo "<span class=\"title\">pull.php — locked</span>";
+    echo "<a class=\"home\" href=\"/\" title=\"Go to site root\">⌂ site root</a></div>";
+    echo "<pre class=\"out\">$ pull.php\n<span class=\"is-cmt\"># This deploy is password protected.</span>\n";
+    foreach ($errors as $e) {
+        echo "<span class=\"is-err\">! " . htmlspecialchars($e, ENT_QUOTES, 'UTF-8') . "</span>\n";
+    }
+    echo "</pre>";
+    echo "<form method=\"post\" class=\"form\">";
+    echo "<div class=\"fld\">";
+    echo "<label for=\"f_password\"><span class=\"prompt\">&gt;</span> Password</label>";
+    echo "<input id=\"f_password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" autofocus>";
+    echo "</div>";
+    echo "<label class=\"chk\"><input type=\"checkbox\" name=\"remember\" value=\"1\" checked>";
+    echo "<span class=\"t\">remember me on this browser"
+        . "<span class=\"note\">Stores a signed cookie for 30 days so you are not asked again. "
+        . "Uncheck on a shared computer — then the cookie is dropped when the browser closes. "
+        . "Open <code>pull.php?logout=1</code> to forget it.</span></span></label>";
+    echo "<button type=\"submit\" class=\"btn\">$ unlock</button>";
+    echo "</form>";
+    echo "</div></body></html>";
+}
+
 // ---------- first-run setup ----------
 
 function handle_setup_post(string $configPath): void {
@@ -344,8 +545,13 @@ function handle_setup_post(string $configPath): void {
     $ghToken  = (string)($_POST['gh_token'] ?? '');
     $timezone = trim((string)($_POST['timezone'] ?? 'UTC'));
     $keepRaw  = (string)($_POST['keep_files'] ?? '');
+    $password = (string)($_POST['password'] ?? '');
+    $purge    = isset($_POST['purge']);
 
     $errors = [];
+    if ($password !== '' && strlen($password) < 6) {
+        $errors[] = 'password must be at least 6 characters (or empty for no password)';
+    }
     if ($repo === '' || !preg_match('~^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$~', $repo)) {
         $errors[] = 'repo must look like "owner/name"';
     }
@@ -367,19 +573,21 @@ function handle_setup_post(string $configPath): void {
     if ($errors) {
         render_setup_form([
             'repo' => $repo, 'branch' => $branch, 'subdir' => $subdir,
-            'gh_token' => $ghToken,
+            'gh_token' => $ghToken, 'purge' => $purge,
             'timezone' => $timezone, 'keep_files' => implode(', ', $keepFiles),
         ], $errors);
         return;
     }
 
     $config = [
-        'repo'       => $repo,
-        'branch'     => $branch,
-        'subdir'     => $subdir,
-        'gh_token'   => $ghToken,
-        'keep_files' => $keepFiles,
-        'timezone'   => $timezone,
+        'repo'          => $repo,
+        'branch'        => $branch,
+        'subdir'        => $subdir,
+        'gh_token'      => $ghToken,
+        'keep_files'    => $keepFiles,
+        'timezone'      => $timezone,
+        'password_hash' => $password !== '' ? password_hash($password, PASSWORD_DEFAULT) : '',
+        'purge'         => $purge,
     ];
 
     $body = "<?php\n"
@@ -390,7 +598,7 @@ function handle_setup_post(string $configPath): void {
     if (@file_put_contents($configPath, $body, LOCK_EX) === false) {
         render_setup_form([
             'repo' => $repo, 'branch' => $branch, 'subdir' => $subdir,
-            'gh_token' => $ghToken,
+            'gh_token' => $ghToken, 'purge' => $purge,
             'timezone' => $timezone, 'keep_files' => implode(', ', $keepFiles),
         ], ['cannot write pull-config.php — check directory permissions']);
         return;
@@ -408,6 +616,8 @@ function render_setup_form(array $values = [], array $errors = []): void {
     $ghToken  = $h($values['gh_token'] ?? '');
     $timezone = $h($values['timezone'] ?? 'UTC');
     $keep     = $h($values['keep_files'] ?? 'pull.php, pull-config.php');
+    // Password is never echoed back into the form; purge defaults to on for new installs.
+    $purge    = (bool)($values['purge'] ?? true);
 
     header('Content-Type: text/html; charset=utf-8');
     echo "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">";
@@ -505,6 +715,28 @@ function render_setup_form(array $values = [], array $errors = []): void {
         true
     );
 
+    setup_field(
+        'password', 'Password to run the deploy',
+        '', 'leave empty for no password', true,
+        [
+            'Asked before every pull. Stored hashed in <code>pull-config.php</code> — the password itself is never written to disk.',
+            'The unlock screen offers <strong>&laquo;remember me&raquo;</strong>: a signed cookie valid 30 days, so you are not asked again on this browser. Unchecked, it lasts only until the browser closes.',
+            'From cron, send it as a header instead: <code>curl -H "X-Pull-Password: ..." "https://host/pull.php?plain=1"</code>.',
+            'Leave empty to keep the deploy open to anyone who knows the URL.',
+        ]
+    );
+
+    setup_check(
+        'purge', 'Delete files that are gone from the repository',
+        $purge,
+        [
+            'Runs after each copy and makes this directory an exact mirror of the repo folder: anything not in the repo is deleted.',
+            'Off: files deleted from the repo stay on the server forever and pile up.',
+            'Files listed above under &laquo;Files to preserve&raquo; are never touched. Deletion is skipped entirely if the download or unpack fails.',
+        ],
+        'Irreversible: deleted files go straight from disk, not to a recycle bin. Anything created on the server and absent from the repo — uploads, caches, logs — is lost unless it is in the preserve list.'
+    );
+
     echo "<button type=\"submit\" class=\"btn\">$ save_config</button>";
     echo "</form>";
     echo "</div>"; // .term
@@ -529,6 +761,19 @@ function setup_field(string $name, string $label, string $value, string $placeho
     echo "</div>";
 }
 
+function setup_check(string $name, string $label, bool $checked, array $help, string $warning = ''): void {
+    $on = $checked ? ' checked' : '';
+    echo "<div class=\"fld\">";
+    echo "<label class=\"chk\" for=\"f_{$name}\">";
+    echo "<input id=\"f_{$name}\" name=\"{$name}\" type=\"checkbox\" value=\"1\"{$on}>";
+    echo "<span class=\"t\">{$label}</span></label>";
+    echo "<div class=\"help\">";
+    foreach ($help as $h) echo "<div>" . $h . "</div>";
+    if ($warning !== '') echo "<div class=\"warn\">&#9888; " . $warning . "</div>";
+    echo "</div>";
+    echo "</div>";
+}
+
 function render_setup_done(array $config): void {
     $h = function ($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); };
     header('Content-Type: text/html; charset=utf-8');
@@ -544,7 +789,9 @@ function render_setup_done(array $config): void {
     echo "  repo:     " . $h($config['repo']) . "\n";
     echo "  branch:   " . $h($config['branch']) . "\n";
     echo "  subdir:   " . $h($config['subdir']) . "\n";
-    echo "  timezone: " . $h($config['timezone']) . "\n\n";
+    echo "  timezone: " . $h($config['timezone']) . "\n";
+    echo "  password: " . ($config['password_hash'] !== '' ? "set (asked before every pull)" : "not set (anyone with the URL can deploy)") . "\n";
+    echo "  purge:    " . ($config['purge'] ? "on — files missing from the repo are deleted, irreversibly" : "off — obsolete files stay in place") . "\n\n";
     echo "# delete pull-config.php to re-run setup.\n";
     echo "</pre>";
     echo "<a class=\"btn\" href=\"pull.php\">$ run_pull_now</a>";
@@ -583,6 +830,7 @@ html,body{margin:0;padding:0;background:var(--bg2);color:var(--fg);
 .out .line.is-err{color:var(--red)}
 .out .line.is-cmt{color:var(--mute)}
 .out .line.is-info{color:var(--cyan)}
+.out .line.is-warn{color:var(--yellow)}
 .out .caret{display:inline-block;width:8px;height:1em;
   background:var(--accent);vertical-align:-2px;
   animation:blink 1s steps(1) infinite}
@@ -600,6 +848,16 @@ html,body{margin:0;padding:0;background:var(--bg2);color:var(--fg);
   padding:9px 11px;font:inherit;outline:none;caret-color:var(--accent)}
 .fld input:focus,.fld textarea:focus{border-color:var(--accent)}
 .fld textarea{resize:vertical}
+.chk{display:flex;align-items:flex-start;gap:10px;margin:0 0 6px;
+  color:var(--accent);font-weight:600;cursor:pointer}
+.chk input[type=checkbox]{width:16px;height:16px;flex:0 0 auto;margin:3px 0 0;
+  accent-color:var(--accent);cursor:pointer}
+.chk .t{display:block;font-weight:600}
+.chk .note{display:block;color:var(--mute);font-weight:400;font-size:12.5px;margin-top:4px}
+.chk .note code{background:#1a1a1a;padding:1px 6px;border-radius:3px;color:#d7d7d7}
+.fld .help .warn{color:var(--yellow);margin-top:6px}
+.out .is-cmt{color:var(--mute)}
+.out .is-err{color:var(--red)}
 .btn{display:inline-block;margin:8px 20px 22px;padding:10px 18px;
   background:#1a1a1a;color:var(--accent);
   border:1px solid var(--accent);border-radius:4px;
@@ -667,9 +925,11 @@ JS;
     if (!s) return '';
     if (s.startsWith('error:') || s.startsWith('!')) return ' is-err';
     if (s.startsWith('warning:')) return ' is-err';
+    if (s.startsWith('purge:') || s.startsWith('deleted')) return ' is-warn';
     if (s.startsWith('#'))   return ' is-cmt';
     if (s.startsWith('==='))  return ' is-cmd';
     if (/^(START|END|STATUS|DURATION|FILES):/.test(s)) return ' is-info';
+    if (/^DELETED:/.test(s)) return ' is-warn';
     if (s.startsWith('downloading') || s.startsWith('downloaded') ||
         s.startsWith('extracted')   || s.startsWith('copied')     ||
         s.startsWith('copying'))    return ' is-info';
