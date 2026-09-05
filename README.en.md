@@ -14,9 +14,13 @@ deployed, so a change can be looked at on a real server before it is merged. The
 script remembers which commit is live, which is what lets it **pull on its own**:
 the tracking screen at `pull.php?watch=1` deploys a new commit as soon as it
 appears, and `pull.php?check=1` in cron downloads nothing while the commit has
-not moved. All of it is configured by the first-run form — which also has a
-button that opens GitHub with the right fine-grained token permissions already
-selected.
+not moved. Deployed versions are kept in a log, so **any of them can be rolled back to in
+one click** — with the date it was live on the server.
+
+All of it is configured by the first-run form — which also has a button that
+opens GitHub with the right fine-grained token permissions already selected.
+
+![Tracking screen at pull.php?watch=1](docs/tracking.png)
 
 ---
 
@@ -70,6 +74,7 @@ an exact copy, with no accumulated leftovers.
 | Setup | — | a browser form on first open |
 | What is on the server | "some version" | the commit recorded in `pull-state.json` |
 | Reviewing a PR | download the branch, upload by hand | `pull.php?watch=1` tracks and deploys it |
+| Rolling back | dig out a backup, upload over FTP | a button next to the version and its deploy date |
 
 ### When not to use it
 
@@ -102,7 +107,8 @@ Honest limits:
 6. If mirror mode is on, deletes everything in the directory that is no longer
    in the repository.
 7. Writes the deployed commit to `pull-state.json` — that is how you can tell
-   what is live, and how "deploy only what changed" works.
+   what is live, how "deploy only what changed" works, and where the versions
+   offered for rollback come from.
 8. Cleans up temp files and prints a summary banner: status, start and end time,
    duration, the commit, files copied and files deleted.
 
@@ -125,6 +131,13 @@ Honest limits:
    fill it in and press "save_config".
 4. The script writes `pull-config.php` (mode `0600`) and offers to run the first
    deploy right away, or to open the tracking screen.
+
+<details>
+<summary>What the setup form looks like</summary>
+
+![First-run setup form](docs/setup.png)
+
+</details>
 
 From then on, every visit to `pull.php` performs a deploy, and `pull.php?watch=1`
 shows what is live and deploys new commits on its own.
@@ -236,6 +249,52 @@ details, and the time of the last deploy. The password, when set, is required
 here too (as the `X-Pull-Password` header); without it you get a `401` and
 `{"ok":false,"auth":false}`.
 
+## Rolling back to an earlier version
+
+Every deploy is appended to a log inside `pull-state.json`: the commit, where it
+came from (a branch or a PR), the date, and how many files were copied. The
+`pull.php?history=1` screen shows that log as a list of versions — each version
+once, dated by its most recent deploy.
+
+![Versions and rollback](docs/versions.png)
+
+The `$ rollback` button next to a version deploys **that exact commit** again,
+after a confirmation in the browser. Only versions that actually stood on this
+server can be reached: the list comes from the log, so an arbitrary commit cannot
+be slipped in. The last 20 deploys are kept.
+
+### The pin: why auto-deploy does not undo a rollback
+
+After a rollback the directory is pinned to the old version. Otherwise the next
+check would notice the head sitting ahead and immediately undo the rollback.
+While the pin holds:
+
+- `pull.php?check=1` deploys nothing and reports `STATUS: PINNED`;
+- the tracking screen shows `pinned to a rolled-back version` and does not start
+  a deploy on its own (the `$ deploy_now` button still works).
+
+![State after a rollback](docs/pinned.png)
+
+The pin lifts on any ordinary deploy of the current version: the
+`$ deploy_tracked_head` button on the versions screen, `$ deploy_now` on the
+tracking screen, or simply opening `pull.php`. The output then carries an
+`unpinned: …` line and automation resumes.
+
+### What a rollback does and does not do
+
+- A rollback is a deploy of old code over the directory, under the same
+  `keep_files` and mirror-mode rules. It does not roll back databases or files
+  uploaded by users.
+- GitHub must still serve the archive for that commit. For branches it almost
+  always does; a PR head can disappear after a force-push, in which case the
+  rollback fails on download and the directory is left untouched.
+- It can be triggered outside the browser too, as a POST with a `rollback` field:
+
+  ```bash
+  curl -s -X POST -H "X-Pull-Password: secret" \
+       -d "rollback=<full sha>" "https://your-site/pull.php?plain=1"
+  ```
+
 ## Deleting obsolete files (mirror mode)
 
 The `purge` option — the "Delete files that are gone from the repository"
@@ -291,6 +350,8 @@ https://github.com/settings/personal-access-tokens/new
   &pull_requests=read      ← only when tracking a PR
   &target_name=owner
 ```
+
+![The token generation button](docs/token.png)
 
 One thing the link cannot preselect: the repositories themselves. On the page
 that opens, pick **Repository access → Only select repositories**, tick your
@@ -361,6 +422,7 @@ control panel, for example).
 | `pull.php?watch=1` | tracking screen; deploys by itself while the box is ticked |
 | `pull.php?check=1` | deploys only if the commit moved (for cron) |
 | `pull.php?status=1` | JSON: what is on GitHub, what is live, is there a difference |
+| `pull.php?history=1` | deployed versions with dates and a rollback button |
 | `pull.php?plain=1` | the same output without markup, `text/plain` |
 | `pull.php?logout=1` | forget the remembered password in this browser |
 
@@ -371,7 +433,8 @@ https://your-site/pull.php
 ```
 
 The output is styled as a terminal and streams as the run progresses. The title
-bar carries a **◉ tracking** link to the tracking screen.
+bar carries **◉ tracking** and **⟲ versions** links to the tracking screen and to
+the list of deployed versions.
 
 From cron or curl — `?plain=1` returns clean `text/plain` with no markup, and
 the password goes in the `X-Pull-Password` header:
@@ -396,14 +459,14 @@ commit has not changed:
 The password is also accepted as `?password=…`, but that lands in web server
 logs and browser history — the header is safer.
 
-Response codes: `200` success (including "already up to date" with `check=1`),
+Response codes: `200` success (including "already up to date" and "pinned" with `check=1`),
 `401` password required or wrong, `403` IP not allowed, `502` archive download
 failed or the pull request could not be read, `500` unpack error, missing
 `ZipArchive`, subdirectory not found, or temp directory not writable.
 
 Output is streamed, so failures found once copying is under way land in the text
 rather than in the status code — in scripts, read the `STATUS:` line at the end
-(`DONE`, `UP-TO-DATE`, `FAILED`).
+(`DONE`, `UP-TO-DATE`, `PINNED`, `FAILED`).
 
 ## Things to know
 
@@ -421,9 +484,11 @@ rather than in the status code — in scripts, read the `STATUS:` line at the en
   `0600`, but passing the token via `GITHUB_TOKEN` is safer.
 - **Tracking only runs while the tab is open.** `?watch=1` is a browser page, not
   a daemon. A server that must update itself needs cron with `?check=1`.
-- **`pull-state.json` holds the PR number and title** and is created with mode
-  `0600` so it is not served over HTTP. Deleting it breaks nothing — the next
-  deploy simply ships everything again.
+- **`pull-state.json` holds the deploy log** — commits, dates, PR numbers and
+  titles. It is created with mode `0600` so it is not served over HTTP. Deleting
+  it breaks nothing, but the rollback history goes with it.
+- **A rollback does not touch data.** Only code from the repository comes back;
+  anything living outside it (databases, uploads, caches) stays as it is.
 
 ## Security
 

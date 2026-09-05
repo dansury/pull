@@ -8,6 +8,8 @@
 // Append ?watch=1 for the tracking screen: it polls the tracked ref and can deploy on its own.
 // Append ?check=1 to deploy only when the tracked ref moved (the cron-friendly entry point).
 // Append ?status=1 for a JSON snapshot of "what is live vs. what is on GitHub".
+// Append ?history=1 for the deploy log: every version that stood here, with the
+//   date it was deployed and a button to roll back to it.
 // Append ?logout=1 to forget a remembered password on this browser.
 //
 // What gets deployed is picked during setup: the head of a branch, or the head of a
@@ -31,6 +33,9 @@ const PAT_CLASSIC_URL = 'https://github.com/settings/tokens/new?scopes=repo&desc
 
 const AUTO_INTERVAL_MIN = 15;
 const AUTO_INTERVAL_DEF = 60;
+
+// How many past deploys stay in the log, and so how far back a rollback can reach.
+const HISTORY_MAX = 20;
 
 const AUTH_COOKIE       = 'pull_auth';
 const AUTH_REMEMBER_TTL = 2592000; // "remember me" cookie lifetime: 30 days
@@ -85,19 +90,26 @@ if ($config['password_hash'] !== '') {
 
 $ghToken = (string)(getenv('GITHUB_TOKEN') ?: $config['gh_token']);
 
-// Tracking endpoints. Both answer without touching the target directory.
-if (isset($_GET['status'])) { emit_status_json($config, $ghToken); exit; }
-if (isset($_GET['watch']))  { render_watch_page($config);          exit; }
+// Read-only endpoints. None of them touch the target directory.
+if (isset($_GET['status']))  { emit_status_json($config, $ghToken); exit; }
+if (isset($_GET['watch']))   { render_watch_page($config);          exit; }
+if (isset($_GET['history'])) { render_history_page($config);        exit; }
 
 // ?check=1 deploys only when the tracked ref moved since the last successful pull.
 $checkOnly = isset($_GET['check']);
 
-// Resolve what to deploy — a branch head or a pull request head — before any output,
-// so a hard failure can still answer with a real HTTP status instead of a 200 with
-// an error inside it. Streaming starts right after, as it always did.
-$track    = resolve_target($config, $ghToken);
+// A rollback re-deploys a commit that already stood on this server. The version is
+// looked up in the deploy log, so only what actually ran here can be rolled back to.
+$rollbackTo = trim((string)($_POST['rollback'] ?? $_GET['rollback'] ?? ''));
+
+// Resolve what to deploy before any output, so a hard failure can still answer with
+// a real HTTP status instead of a 200 with an error inside it. Streaming starts
+// right after, as it always did.
 $state    = state_read();
 $deployed = (string)($state['sha'] ?? '');
+$track    = $rollbackTo !== ''
+    ? resolve_rollback($rollbackTo, $state)
+    : resolve_target($config, $ghToken);
 if ($track['fatal']) http_response_code(502);
 
 start_output($plain);
@@ -111,9 +123,11 @@ term("  START:    {$startStr} ({$tz})");
 term("================================================");
 term("");
 
-term("tracking:  {$track['label']}");
+$isRollback = $track['mode'] === 'rollback';
+
+term(($isRollback ? "rollback:  " : "tracking:  ") . $track['label']);
 if ($track['sha'] !== '') {
-    term("head:      " . short_sha($track['sha'])
+    term(($isRollback ? "version:   " : "head:      ") . short_sha($track['sha'])
         . ($deployed !== ''
             ? "   (deployed: " . short_sha($deployed) . ")"
             : "   (nothing deployed from here yet)"));
@@ -123,8 +137,24 @@ if ($track['error'] !== '') term("warning: {$track['error']}");
 // A pull request that cannot be resolved has no safe fallback — stop before the copy.
 if ($track['fatal']) {
     term("error: cannot resolve what to deploy — nothing was touched");
-    foreach (token_hint_lines($config) as $line) term($line);
+    // A missing version is a bad parameter, not a permissions problem: no token hints.
+    if ($isRollback) {
+        term("hint: pull.php?history=1 lists the versions that can be rolled back to");
+    } else {
+        foreach (token_hint_lines($config) as $line) term($line);
+    }
     print_finish_banner($startTs, $startStr, $tz, false);
+    end_output();
+    exit;
+}
+
+// A rollback pins this directory to an old commit. Automatic deploys stand down
+// until someone deploys the tracked head again, otherwise the next check would
+// immediately undo the rollback.
+if ($checkOnly && !$isRollback && !empty($state['pinned'])) {
+    term("check: pinned to " . short_sha($deployed) . " by a rollback on " . (string)($state['at'] ?? '?'));
+    term("       automatic deploys are paused — open pull.php to deploy the tracked head and resume");
+    print_finish_banner($startTs, $startStr, $tz, true, 0, null, 'PINNED');
     end_output();
     exit;
 }
@@ -262,21 +292,28 @@ if ($config['purge']) {
 
 cleanup($tmp); // only now — purge compares the target against $src
 
-// Remember what is live, so the next ?check=1 knows whether anything moved.
-state_write([
+// Remember what is live and append to the deploy log: that is what the next
+// ?check=1 compares against, and what a rollback can later reach back to.
+state_record_deploy([
     'sha'      => $track['sha'],
     'ref'      => $track['ref'],
-    'mode'     => $track['mode'],
-    'label'    => $track['label'],
+    'mode'     => $isRollback ? (string)($track['from']['mode'] ?? 'rollback') : $track['mode'],
+    'label'    => $isRollback ? (string)($track['from']['label'] ?? $track['label']) : $track['label'],
     'pr'       => $track['pr'],
     'at'       => date('Y-m-d H:i:s'),
     'at_utc'   => gmdate('c'),
     'status'   => 'ok',
     'files'    => $copied,
     'deleted'  => $deleted,
-]);
+    'rollback' => $isRollback,
+], $isRollback);
 
 if ($track['sha'] !== '') term("deployed commit " . short_sha($track['sha']) . " recorded in " . STATE_FILE);
+if ($isRollback) {
+    term("pinned: automatic deploys are paused until the tracked head is deployed from pull.php");
+} elseif (!empty($state['pinned'])) {
+    term("unpinned: back on the tracked ref, automatic deploys resume");
+}
 
 print_finish_banner($startTs, $startStr, $tz, true, $copied, $deleted, 'DONE', $track);
 end_output();
@@ -307,6 +344,7 @@ function start_output(bool $plain): void {
     echo "<span class=\"dot r\"></span><span class=\"dot y\"></span><span class=\"dot g\"></span>";
     echo "<span class=\"title\">pull.php — " . htmlspecialchars(gethostname() ?: 'localhost', ENT_QUOTES, 'UTF-8') . "</span>";
     echo "<a class=\"home\" href=\"?watch=1\" title=\"Live tracking screen\">◉ tracking</a>";
+    echo "<a class=\"home\" href=\"?history=1\" title=\"Deployed versions and rollback\">⟲ versions</a>";
     echo "<a class=\"home\" href=\"/\" title=\"Go to site root\">⌂ site root</a></div>";
     echo "<pre id=\"out\" class=\"out\"></pre></div>";
     echo terminal_js();
@@ -412,6 +450,89 @@ function state_write(array $state): void {
     if ($json === false) return;
     @file_put_contents(state_path(), $json . "\n", LOCK_EX);
     @chmod(state_path(), 0600); // it lives in the web root — keep PR titles out of public reach
+}
+
+// Appends a deploy to the log and marks what is live. $pinned is set by a rollback:
+// it tells the automatic paths to stand down so they do not undo it.
+function state_record_deploy(array $entry, bool $pinned): void {
+    $state   = state_read();
+    $history = isset($state['history']) && is_array($state['history']) ? $state['history'] : [];
+
+    // Deploying the same commit twice in a row refreshes the top entry instead of
+    // filling the log with repeats of one version.
+    if (!empty($history) && (string)($history[0]['sha'] ?? '') === (string)$entry['sha'] && empty($entry['rollback'])) {
+        $history[0] = $entry;
+    } else {
+        array_unshift($history, $entry);
+    }
+
+    $state            = $entry;
+    $state['pinned']  = $pinned;
+    $state['history'] = array_slice($history, 0, HISTORY_MAX);
+    state_write($state);
+}
+
+// The log is a deploy journal, but what a rollback picks from is a list of versions:
+// one entry per commit, carrying the last date it was deployed.
+function history_versions(array $state): array {
+    $seen = [];
+    $out  = [];
+    foreach (($state['history'] ?? []) as $entry) {
+        if (!is_array($entry)) continue;
+        $sha = (string)($entry['sha'] ?? '');
+        if ($sha === '' || isset($seen[$sha])) continue;
+        $seen[$sha] = true;
+        $out[] = $entry;
+    }
+    return $out;
+}
+
+// "3 d ago" next to an exact timestamp — the age is what tells you at a glance
+// how old the version you are about to roll back to actually is.
+function human_age(string $iso): string {
+    $t = strtotime($iso);
+    if ($t === false) return '';
+    $d = time() - $t;
+    if ($d < 90)     return 'just now';
+    if ($d < 5400)   return (int)floor($d / 60) . ' min ago';
+    if ($d < 172800) return (int)floor($d / 3600) . ' h ago';
+    return (int)floor($d / 86400) . ' d ago';
+}
+
+// Looks a rollback target up in the deploy log. Only versions that actually stood
+// here can be reached, so a stray parameter cannot deploy an arbitrary commit.
+function resolve_rollback(string $wanted, array $state): array {
+    $out = [
+        'mode' => 'rollback', 'ref' => '', 'sha' => '', 'label' => '',
+        'error' => '', 'fatal' => false, 'pr' => null, 'commit' => null, 'from' => null,
+    ];
+    $wanted = strtolower((string)preg_replace('~[^0-9a-fA-F]~', '', $wanted));
+    $out['label'] = $wanted === '' ? 'requested version is empty' : "requested version {$wanted}";
+    if (strlen($wanted) < 7) {
+        $out['error'] = 'a rollback needs at least the first 7 characters of the commit id';
+        $out['fatal'] = true;
+        return $out;
+    }
+
+    foreach (($state['history'] ?? []) as $entry) {
+        if (!is_array($entry)) continue;
+        $sha = strtolower((string)($entry['sha'] ?? ''));
+        if ($sha !== '' && strpos($sha, $wanted) === 0) {
+            $out['sha']   = (string)$entry['sha'];
+            $out['ref']   = (string)($entry['ref'] ?? '');
+            $out['pr']    = $entry['pr'] ?? null;
+            $out['from']  = $entry;
+            $out['label'] = "back to " . short_sha($out['sha']) . " — "
+                          . (string)($entry['label'] ?? $entry['ref'] ?? 'unknown source')
+                          . ", deployed " . (string)($entry['at'] ?? 'at an unknown time');
+            return $out;
+        }
+    }
+
+    $out['error'] = "{$wanted} is not in the deploy log — only versions listed at "
+                  . "pull.php?history=1 can be rolled back to";
+    $out['fatal'] = true;
+    return $out;
 }
 
 // Minimal GitHub REST client. Returns [decoded body, ''] or [null, 'reason'].
@@ -562,6 +683,23 @@ function token_hint_lines(array $config): array {
     ]);
 }
 
+// Compact deploy log for JSON consumers: enough to show it, not the whole record.
+function history_summary(array $state): array {
+    $out = [];
+    foreach (history_versions($state) as $entry) {
+        $out[] = [
+            'sha'      => (string)($entry['sha'] ?? ''),
+            'short'    => short_sha((string)($entry['sha'] ?? '')),
+            'at'       => (string)($entry['at'] ?? ''),
+            'age'      => human_age((string)($entry['at_utc'] ?? '')),
+            'label'    => (string)($entry['label'] ?? ''),
+            'ref'      => (string)($entry['ref'] ?? ''),
+            'rollback' => !empty($entry['rollback']),
+        ];
+    }
+    return $out;
+}
+
 // JSON snapshot for the tracking screen and for anything else that wants to poll.
 function emit_status_json(array $config, string $token): void {
     header('Content-Type: application/json; charset=utf-8');
@@ -591,9 +729,108 @@ function emit_status_json(array $config, string $token): void {
         'auto'          => $config['auto_pull'],
         'interval'      => $config['auto_interval'],
         'purge'         => $config['purge'],
+        // A rollback pins the directory: the tracked head then sits ahead on purpose.
+        'pinned'        => !empty($state['pinned']),
+        'pinned_at'     => (string)($state['at'] ?? ''),
+        'history'       => history_summary($state),
         'now'           => date('Y-m-d H:i:s'),
         'tz'            => date_default_timezone_get(),
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+}
+
+// ---------- deploy log / rollback screen ----------
+
+// Every version that stood in this directory, newest first, with the date it was
+// deployed and a button that puts it back.
+function render_history_page(array $config): void {
+    $h = function ($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); };
+    $state   = state_read();
+    $live    = (string)($state['sha'] ?? '');
+    $pinned  = !empty($state['pinned']);
+    $history = history_versions($state);
+    // Post to the bare script name, never back to ?history=1 — and keep working
+    // when the file has been renamed to something unguessable.
+    $self    = $h(basename((string)($_SERVER['SCRIPT_NAME'] ?? 'pull.php')));
+
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">";
+    echo "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+    echo "<meta name=\"robots\" content=\"noindex,nofollow\">";
+    echo "<title>pull.php — versions</title>";
+    echo terminal_css();
+    echo "</head><body><div class=\"term\"><div class=\"bar\">";
+    echo "<span class=\"dot r\"></span><span class=\"dot y\"></span><span class=\"dot g\"></span>";
+    echo "<span class=\"title\">pull.php — versions of " . $h($config['repo']) . "</span>";
+    echo "<a class=\"home\" href=\"?watch=1\" title=\"Live tracking screen\">◉ tracking</a>";
+    echo "<a class=\"home\" href=\"/\" title=\"Go to site root\">⌂ site root</a></div>";
+
+    echo "<div class=\"panel\">";
+    echo "<div class=\"row\"><span class=\"k\">live now</span><span class=\"v" . ($live === '' ? ' is-warn' : '') . "\">"
+        . ($live === ''
+            ? "nothing deployed from here yet"
+            : $h(short_sha($live)) . " <span class=\"mute\">— " . $h((string)($state['label'] ?? '')) . "</span>")
+        . "</span></div>";
+    if ($live !== '') {
+        echo "<div class=\"row\"><span class=\"k\">deployed</span><span class=\"v\">"
+            . $h((string)($state['at'] ?? '')) . " <span class=\"mute\">" . $h(human_age((string)($state['at_utc'] ?? ''))) . "</span></span></div>";
+    }
+    echo "<div class=\"row\"><span class=\"k\">auto-deploy</span><span class=\"v" . ($pinned ? ' is-warn' : '') . "\">"
+        . ($pinned
+            ? "paused — this directory is pinned to a rolled-back version"
+            : ($config['auto_pull'] ? "follows the tracked ref" : "off"))
+        . "</span></div>";
+    echo "</div>";
+
+    echo "<div class=\"ctl\">";
+    echo "<a class=\"btn\" href=\"{$self}\">$ deploy_tracked_head</a>";
+    echo "<span class=\"mute\">" . ($pinned
+        ? "deploying the tracked head lifts the pin and lets automatic deploys resume"
+        : "deploys the head of the tracked ref, as usual") . "</span>";
+    echo "</div>";
+
+    if ($history === []) {
+        echo "<pre class=\"out\">$ no deploys recorded yet\n"
+            . "<span class=\"is-cmt\"># " . STATE_FILE . " fills up as deploys run; a rollback can reach\n"
+            . "# back through the last " . HISTORY_MAX . " of them.</span></pre>";
+        echo "</div></body></html>";
+        return;
+    }
+
+    echo "<div class=\"vlist\">";
+    foreach ($history as $entry) {
+        $sha   = (string)($entry['sha'] ?? '');
+        $isNow = $sha !== '' && $sha === $live;
+        echo "<div class=\"ventry" . ($isNow ? ' live' : '') . "\">";
+        echo "<span class=\"when\">" . $h((string)($entry['at'] ?? '')) . "<span class=\"age\">"
+            . $h(human_age((string)($entry['at_utc'] ?? ''))) . "</span></span>";
+        echo "<span class=\"sha\">" . $h(short_sha($sha)) . "</span>";
+        echo "<span class=\"what\">" . $h((string)($entry['label'] ?? $entry['ref'] ?? ''))
+            . (!empty($entry['rollback']) ? " <span class=\"tag\">rollback</span>" : "")
+            . "<span class=\"files\">" . (int)($entry['files'] ?? 0) . " files"
+            . (isset($entry['deleted']) && $entry['deleted'] !== null ? ", " . (int)$entry['deleted'] . " deleted" : "")
+            . "</span></span>";
+        if ($isNow) {
+            echo "<span class=\"nowtag\">live now</span>";
+        } else {
+            echo "<form method=\"post\" action=\"{$self}\" class=\"rb\">";
+            echo "<input type=\"hidden\" name=\"rollback\" value=\"" . $h($sha) . "\">";
+            echo "<button type=\"submit\" class=\"btn\" data-sha=\"" . $h(short_sha($sha))
+                . "\" data-at=\"" . $h((string)($entry['at'] ?? '')) . "\">$ rollback</button>";
+            echo "</form>";
+        }
+        echo "</div>";
+    }
+    echo "</div>";
+
+    echo "<pre class=\"out\"><span class=\"is-cmt\">"
+        . "# Each version is listed once, dated by its most recent deploy.\n"
+        . "# A rollback re-deploys that exact commit and pins this directory to it,\n"
+        . "# so scheduled and automatic deploys stand down until you deploy the\n"
+        . "# tracked head again. The last " . HISTORY_MAX . " deploys are kept.</span></pre>";
+    echo "</div>";
+    echo history_js();
+    echo "</body></html>";
 }
 
 // ---------- tracking screen ----------
@@ -605,6 +842,7 @@ function render_watch_page(array $config): void {
     $cfg = json_encode([
         'interval' => $config['auto_interval'],
         'auto'     => $config['auto_pull'],
+        'pinned'   => !empty(state_read()['pinned']),
     ], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
 
     header('Content-Type: text/html; charset=utf-8');
@@ -617,6 +855,7 @@ function render_watch_page(array $config): void {
     echo "</head><body><div class=\"term\"><div class=\"bar\">";
     echo "<span class=\"dot r\"></span><span class=\"dot y\"></span><span class=\"dot g\"></span>";
     echo "<span class=\"title\">pull.php — tracking " . $h($config['repo']) . "</span>";
+    echo "<a class=\"home\" href=\"?history=1\" title=\"Deployed versions and rollback\">⟲ versions</a>";
     echo "<a class=\"home\" href=\"/\" title=\"Go to site root\">⌂ site root</a></div>";
 
     echo "<div class=\"panel\" id=\"panel\"><div class=\"mute\">connecting…</div></div>";
@@ -1209,6 +1448,7 @@ function render_setup_done(array $config): void {
         ? "on — the tracking screen deploys a new commit within " . $h($config['auto_interval']) . "s"
         : "off — deploys only when you ask for one") . "\n\n";
     echo "# tracking screen:  pull.php?watch=1\n";
+    echo "# deployed versions / rollback:  pull.php?history=1\n";
     echo "# deploy if changed: curl -s \"https://host/pull.php?check=1&plain=1\"   (for cron)\n";
     echo "# delete pull-config.php to re-run setup.\n";
     echo "</pre>";
@@ -1296,7 +1536,7 @@ html,body{margin:0;padding:0;background:var(--bg2);color:var(--fg);
 /* tracking screen */
 .panel{padding:14px 20px;background:#262626;border-bottom:1px solid #3a3a3a}
 .panel .row{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:2px 0}
-.panel .k{flex:0 0 92px;color:var(--mute)}
+.panel .k{flex:0 0 108px;color:var(--mute);white-space:nowrap}
 .panel .v{flex:1 1 240px;word-break:break-word}
 .panel .v a{color:var(--cyan)}
 .panel .is-ok{color:var(--green)}
@@ -1307,8 +1547,44 @@ html,body{margin:0;padding:0;background:var(--bg2);color:var(--fg);
 .ctl .btn{margin:0;padding:7px 14px}
 .ctl .chk{margin:0;font-size:13px}
 .panel ~ .out{max-height:55vh;overflow:auto}
+.vlist ~ .out{max-height:none}
+/* deploy log / rollback */
+.vlist{padding:4px 20px 10px}
+.ventry{display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;
+  padding:11px 0;border-bottom:1px solid #383838}
+.ventry:last-child{border-bottom:none}
+.ventry.live{background:#252f28;margin:0 -20px;padding-left:20px;padding-right:20px}
+.ventry .when{flex:0 0 170px;color:var(--cyan)}
+.ventry .when .age{display:block;color:var(--mute);font-size:12px}
+.ventry .sha{flex:0 0 70px;color:var(--fg)}
+.ventry .what{flex:1 1 220px;color:var(--mute);word-break:break-word}
+.ventry .what .files{display:block;font-size:12px;color:#7a7f85}
+.ventry .tag{color:var(--yellow);border:1px solid var(--yellow);border-radius:3px;
+  padding:0 5px;font-size:11px;margin-left:4px}
+.ventry .nowtag{flex:0 0 auto;color:var(--green);border:1px solid var(--green);
+  border-radius:4px;padding:5px 12px;font-size:12.5px}
+.ventry form{margin:0;flex:0 0 auto}
+.ventry .btn{margin:0;padding:5px 12px;font-size:12.5px}
 </style>
 CSS;
+}
+
+function history_js(): string {
+    return <<<'JS'
+<script>
+(function(){
+  // Rolling back overwrites the live site, so make it a deliberate click.
+  document.querySelectorAll('form.rb button').forEach(btn => {
+    btn.addEventListener('click', ev => {
+      const ok = confirm('Roll back to ' + btn.dataset.sha + ' (deployed ' + btn.dataset.at + ')?\n\n' +
+        'That commit is deployed again over this directory, and automatic deploys ' +
+        'pause until you deploy the tracked head.');
+      if (!ok) ev.preventDefault();
+    });
+  });
+})();
+</script>
+JS;
 }
 
 function watch_js(): string {
@@ -1367,6 +1643,7 @@ function watch_js(): string {
 
     let badge, cls;
     if (s.error)           { badge = 'error';            cls = ' is-err'; }
+    else if (s.pinned)     { badge = 'pinned to a rolled-back version'; cls = ' is-warn'; }
     else if (!s.deployed)  { badge = 'never deployed';   cls = ' is-warn'; }
     else if (s.changed)    { badge = 'new commit ahead'; cls = ' is-warn'; }
     else                   { badge = 'up to date';       cls = ' is-ok'; }
@@ -1389,6 +1666,9 @@ function watch_js(): string {
       row('deployed', s.deployed
             ? esc(s.deployed_short) + ' <span class="mute">at ' + esc(s.deployed_at) + '</span>'
             : '<span class="mute">nothing deployed from here yet</span>') +
+      (s.pinned ? row('pinned', 'rolled back on ' + esc(s.pinned_at) +
+            ' — auto-deploy paused. <a href="?history=1">versions</a>, or press deploy_now to return to the head.',
+            ' is-warn') : '') +
       (s.error ? row('note', esc(s.error), ' is-err') : '') +
       row('checked',  esc(s.now) + ' <span class="mute">(' + esc(s.tz) + ')</span>');
 
@@ -1455,7 +1735,9 @@ function watch_js(): string {
 
   async function cycle(){
     const s = await poll();
-    if (s && s.changed && autoEl.checked && !running){
+    // A pinned directory is sitting on a rollback on purpose — never deploy over it
+    // by ourselves; only the explicit deploy_now button leaves that state.
+    if (s && s.changed && !s.pinned && autoEl.checked && !running){
       await deploy('auto-deploy: tracked head moved');
     }
     left = every;
@@ -1475,6 +1757,7 @@ function watch_js(): string {
   }, 1000);
 
   line('$ watching every ' + every + 's — auto-deploy is ' + (autoEl.checked ? 'on' : 'off'), ' is-cmd');
+  if (cfg.pinned) line('pinned to a rolled-back version — auto-deploy stays paused until you deploy the head', ' is-warn');
   cycle();
 })();
 </script>
