@@ -5,7 +5,14 @@
 //
 // Usage: open https://<your-host>/pull.php in a browser.
 // Append ?plain=1 for unstyled text/plain output (useful for cron / curl).
+// Append ?watch=1 for the tracking screen: it polls the tracked ref and can deploy on its own.
+// Append ?check=1 to deploy only when the tracked ref moved (the cron-friendly entry point).
+// Append ?status=1 for a JSON snapshot of "what is live vs. what is on GitHub".
 // Append ?logout=1 to forget a remembered password on this browser.
+//
+// What gets deployed is picked during setup: the head of a branch, or the head of a
+// pull request (deploy previews). The deployed commit is remembered in ./pull-state.json,
+// which is what makes "only pull when something changed" possible.
 //
 // Optional password gate (set during setup): the password is stored hashed and
 // can be remembered in a cookie. For cron, send it as the X-Pull-Password header.
@@ -14,7 +21,16 @@
 declare(strict_types=1);
 
 const CONFIG_FILE = 'pull-config.php';
-const ALWAYS_KEEP = ['pull.php', 'pull-config.php'];
+const STATE_FILE  = 'pull-state.json';
+const ALWAYS_KEEP = ['pull.php', 'pull-config.php', 'pull-state.json'];
+
+// Prefilled fine-grained token form: everything but the repository picker can be
+// set from the URL. See docs.github.com -> "Pre-filling personal access token details".
+const PAT_NEW_URL     = 'https://github.com/settings/personal-access-tokens/new';
+const PAT_CLASSIC_URL = 'https://github.com/settings/tokens/new?scopes=repo&description=pull.php+deploy';
+
+const AUTO_INTERVAL_MIN = 15;
+const AUTO_INTERVAL_DEF = 60;
 
 const AUTH_COOKIE       = 'pull_auth';
 const AUTH_REMEMBER_TTL = 2592000; // "remember me" cookie lifetime: 30 days
@@ -60,10 +76,29 @@ if ($denied !== null) {
         . htmlspecialchars($denied, ENT_QUOTES) . "</body>");
 }
 
+$mode = isset($_GET['status']) ? 'json' : ($plain ? 'plain' : 'html');
+
 // Optional password gate. An empty password_hash means open access.
 if ($config['password_hash'] !== '') {
-    require_auth($config['password_hash'], $plain);
+    require_auth($config['password_hash'], $mode);
 }
+
+$ghToken = (string)(getenv('GITHUB_TOKEN') ?: $config['gh_token']);
+
+// Tracking endpoints. Both answer without touching the target directory.
+if (isset($_GET['status'])) { emit_status_json($config, $ghToken); exit; }
+if (isset($_GET['watch']))  { render_watch_page($config);          exit; }
+
+// ?check=1 deploys only when the tracked ref moved since the last successful pull.
+$checkOnly = isset($_GET['check']);
+
+// Resolve what to deploy — a branch head or a pull request head — before any output,
+// so a hard failure can still answer with a real HTTP status instead of a 200 with
+// an error inside it. Streaming starts right after, as it always did.
+$track    = resolve_target($config, $ghToken);
+$state    = state_read();
+$deployed = (string)($state['sha'] ?? '');
+if ($track['fatal']) http_response_code(502);
 
 start_output($plain);
 
@@ -76,6 +111,38 @@ term("  START:    {$startStr} ({$tz})");
 term("================================================");
 term("");
 
+term("tracking:  {$track['label']}");
+if ($track['sha'] !== '') {
+    term("head:      " . short_sha($track['sha'])
+        . ($deployed !== ''
+            ? "   (deployed: " . short_sha($deployed) . ")"
+            : "   (nothing deployed from here yet)"));
+}
+if ($track['error'] !== '') term("warning: {$track['error']}");
+
+// A pull request that cannot be resolved has no safe fallback — stop before the copy.
+if ($track['fatal']) {
+    term("error: cannot resolve what to deploy — nothing was touched");
+    foreach (token_hint_lines($config) as $line) term($line);
+    print_finish_banner($startTs, $startStr, $tz, false);
+    end_output();
+    exit;
+}
+
+if ($checkOnly) {
+    if ($track['sha'] === '') {
+        term("check: head commit unknown — deploying anyway");
+    } elseif ($track['sha'] === $deployed) {
+        term("check: already up to date — nothing to do");
+        print_finish_banner($startTs, $startStr, $tz, true, 0, null, 'UP-TO-DATE');
+        end_output();
+        exit;
+    } else {
+        term("check: new commit found — deploying");
+    }
+}
+term("");
+
 $target = __DIR__;
 $tmp    = sys_get_temp_dir() . '/pull_' . bin2hex(random_bytes(6));
 if (!mkdir($tmp, 0755, true)) {
@@ -86,14 +153,20 @@ if (!mkdir($tmp, 0755, true)) {
     exit;
 }
 
-$ghToken = (string)(getenv('GITHUB_TOKEN') ?: $config['gh_token']);
 $authHeaders = $ghToken !== '' ? ["Authorization: Bearer {$ghToken}"] : [];
 
-$zipUrls = [
-    sprintf('https://api.github.com/repos/%s/zipball/%s', $config['repo'], $config['branch']),
-    sprintf('https://codeload.github.com/%s/zip/refs/heads/%s', $config['repo'], $config['branch']),
-    sprintf('https://github.com/%s/archive/refs/heads/%s.zip', $config['repo'], $config['branch']),
-];
+// With a resolved commit we download that exact sha: the deploy then matches what
+// was reported above, and PR heads are reachable this way while branch names are not.
+$zipUrls = $track['sha'] !== ''
+    ? [
+        sprintf('https://api.github.com/repos/%s/zipball/%s', $config['repo'], $track['sha']),
+        sprintf('https://codeload.github.com/%s/zip/%s', $config['repo'], $track['sha']),
+    ]
+    : [
+        sprintf('https://api.github.com/repos/%s/zipball/%s', $config['repo'], $config['branch']),
+        sprintf('https://codeload.github.com/%s/zip/refs/heads/%s', $config['repo'], $config['branch']),
+        sprintf('https://github.com/%s/archive/refs/heads/%s.zip', $config['repo'], $config['branch']),
+    ];
 $zipFile = $tmp . '/repo.zip';
 
 if ($ghToken === '') {
@@ -112,12 +185,8 @@ if ($bytes <= 0) {
     cleanup($tmp);
     http_response_code(502);
     term("download failed: {$lastErr}");
-    if ($ghToken !== '' && strpos($lastErr, 'http 404') !== false) {
-        term("hint: 404 with a token = token lacks access to this private repo.");
-        term("  - classic PAT: needs full 'repo' scope (not just 'public_repo')");
-        term("  - fine-grained PAT: must include this repo under 'Repository access'");
-        term("    AND grant 'Repository permissions -> Contents: Read'");
-        term("  also check the token isn't expired or revoked");
+    if (strpos($lastErr, 'http 404') !== false || strpos($lastErr, 'http 401') !== false) {
+        foreach (token_hint_lines($config) as $line) term($line);
     }
     print_finish_banner($startTs, $startStr, $tz, false);
     end_output();
@@ -193,7 +262,23 @@ if ($config['purge']) {
 
 cleanup($tmp); // only now — purge compares the target against $src
 
-print_finish_banner($startTs, $startStr, $tz, true, $copied, $deleted);
+// Remember what is live, so the next ?check=1 knows whether anything moved.
+state_write([
+    'sha'      => $track['sha'],
+    'ref'      => $track['ref'],
+    'mode'     => $track['mode'],
+    'label'    => $track['label'],
+    'pr'       => $track['pr'],
+    'at'       => date('Y-m-d H:i:s'),
+    'at_utc'   => gmdate('c'),
+    'status'   => 'ok',
+    'files'    => $copied,
+    'deleted'  => $deleted,
+]);
+
+if ($track['sha'] !== '') term("deployed commit " . short_sha($track['sha']) . " recorded in " . STATE_FILE);
+
+print_finish_banner($startTs, $startStr, $tz, true, $copied, $deleted, 'DONE', $track);
 end_output();
 exit;
 
@@ -221,6 +306,7 @@ function start_output(bool $plain): void {
     echo "</head><body><div class=\"term\"><div class=\"bar\">";
     echo "<span class=\"dot r\"></span><span class=\"dot y\"></span><span class=\"dot g\"></span>";
     echo "<span class=\"title\">pull.php — " . htmlspecialchars(gethostname() ?: 'localhost', ENT_QUOTES, 'UTF-8') . "</span>";
+    echo "<a class=\"home\" href=\"?watch=1\" title=\"Live tracking screen\">◉ tracking</a>";
     echo "<a class=\"home\" href=\"/\" title=\"Go to site root\">⌂ site root</a></div>";
     echo "<pre id=\"out\" class=\"out\"></pre></div>";
     echo terminal_js();
@@ -249,17 +335,23 @@ function term(string $msg): void {
     flush();
 }
 
-function print_finish_banner(float $startTs, string $startStr, string $tz, bool $ok, int $copied = 0, ?int $deleted = null): void {
+function print_finish_banner(
+    float $startTs, string $startStr, string $tz, bool $ok,
+    int $copied = 0, ?int $deleted = null, string $label = '', ?array $track = null
+): void {
     $endTs   = microtime(true);
     $endStr  = date('Y-m-d H:i:s');
     $dur     = $endTs - $startTs;
-    $status  = $ok ? 'DONE' : 'FAILED';
+    $status  = $label !== '' ? $label : ($ok ? 'DONE' : 'FAILED');
     term("");
     term("================================================");
     term("  STATUS:   {$status}");
     term("  START:    {$startStr} ({$tz})");
     term("  END:      {$endStr} ({$tz})");
     term("  DURATION: " . number_format($dur, 2) . " seconds");
+    if ($track !== null && $track['sha'] !== '') {
+        term("  COMMIT:   " . short_sha($track['sha']) . "  (" . $track['ref'] . ")");
+    }
     if ($ok) {
         term("  FILES:    {$copied}");
         if ($deleted !== null) {
@@ -289,7 +381,257 @@ function load_config(string $path): array {
         // older version keeps working and never starts deleting files by surprise.
         'password_hash' => (string)($raw['password_hash'] ?? ''),
         'purge'         => (bool)($raw['purge'] ?? false),
+        // Tracking. A config written before tracking existed has no 'source' key,
+        // so it keeps behaving exactly as it did: plain branch deploys, no auto-pull.
+        'source'        => ((string)($raw['source'] ?? '') === 'pr' || (int)($raw['pr_number'] ?? 0) > 0) ? 'pr' : 'branch',
+        'pr_number'     => max(0, (int)($raw['pr_number'] ?? 0)),
+        'auto_pull'     => (bool)($raw['auto_pull'] ?? false),
+        'auto_interval' => max(AUTO_INTERVAL_MIN, (int)($raw['auto_interval'] ?? AUTO_INTERVAL_DEF)),
     ];
+}
+
+// ---------- tracking: what is on GitHub vs. what is deployed ----------
+
+function short_sha(string $sha): string {
+    return $sha === '' ? '-' : substr($sha, 0, 7);
+}
+
+function state_path(): string {
+    return __DIR__ . '/' . STATE_FILE;
+}
+
+// The deploy log: which commit is currently live. Missing or unreadable = nothing deployed yet.
+function state_read(): array {
+    if (!is_file(state_path())) return [];
+    $raw = json_decode((string)@file_get_contents(state_path()), true);
+    return is_array($raw) ? $raw : [];
+}
+
+function state_write(array $state): void {
+    $json = json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if ($json === false) return;
+    @file_put_contents(state_path(), $json . "\n", LOCK_EX);
+    @chmod(state_path(), 0600); // it lives in the web root — keep PR titles out of public reach
+}
+
+// Minimal GitHub REST client. Returns [decoded body, ''] or [null, 'reason'].
+function gh_api(string $path, string $token): array {
+    $url     = 'https://api.github.com' . $path;
+    $headers = [
+        'Accept: application/vnd.github+json',
+        'X-GitHub-Api-Version: 2022-11-28',
+        'User-Agent: pull.php',
+    ];
+    if ($token !== '') $headers[] = "Authorization: Bearer {$token}";
+
+    $body = '';
+    $code = 0;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_HTTPHEADER     => $headers,
+        ]);
+        $body  = (string)curl_exec($ch);
+        $errno = curl_errno($ch);
+        $err   = curl_error($ch);
+        $code  = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($errno !== 0) return [null, "curl errno {$errno}: {$err}"];
+    } else {
+        if (!ini_get('allow_url_fopen')) return [null, 'no curl and allow_url_fopen=Off'];
+        $hdr = '';
+        foreach ($headers as $h) $hdr .= $h . "\r\n";
+        $ctx  = stream_context_create(['http' => [
+            'header'         => $hdr,
+            'timeout'        => 20,
+            'ignore_errors'  => true,
+            'follow_location'=> 1,
+        ]]);
+        $body = (string)@file_get_contents($url, false, $ctx);
+        foreach ($http_response_header ?? [] as $h) {
+            if (preg_match('~^HTTP/\S+\s+(\d{3})~', $h, $m)) $code = (int)$m[1];
+        }
+    }
+
+    if ($code === 401) return [null, 'http 401 — the token is invalid, expired or revoked'];
+    if ($code === 403) return [null, 'http 403 — rate limited, or the token is not allowed here'];
+    if ($code === 404) return [null, 'http 404 — no such repo/ref, or the token cannot see it'];
+    if ($code >= 400)  return [null, "http {$code}"];
+
+    $data = json_decode($body, true);
+    if (!is_array($data)) return [null, 'unreadable answer from api.github.com'];
+    return [$data, ''];
+}
+
+// Works out the exact commit to deploy. 'fatal' means there is no safe fallback
+// and the caller must abort; a soft 'error' means "deploy the branch tip blindly".
+function resolve_target(array $config, string $token): array {
+    $out = [
+        'mode' => $config['source'], 'ref' => '', 'sha' => '', 'label' => '',
+        'error' => '', 'fatal' => false, 'pr' => null, 'commit' => null,
+    ];
+
+    if ($config['source'] === 'pr') {
+        $n = $config['pr_number'];
+        $out['ref']   = "refs/pull/{$n}/head";
+        $out['label'] = "pull request #{$n} of {$config['repo']}";
+
+        [$pr, $err] = gh_api("/repos/{$config['repo']}/pulls/{$n}", $token);
+        if ($pr === null) {
+            $out['error'] = "cannot read pull request #{$n}: {$err}";
+            $out['fatal'] = true; // deploying the branch instead would ship the wrong code
+            return $out;
+        }
+        $out['pr'] = [
+            'number'  => $n,
+            'title'   => (string)($pr['title'] ?? ''),
+            'state'   => !empty($pr['merged']) ? 'merged' : (string)($pr['state'] ?? ''),
+            'draft'   => (bool)($pr['draft'] ?? false),
+            'author'  => (string)($pr['user']['login'] ?? ''),
+            'head'    => (string)($pr['head']['ref'] ?? ''),
+            'base'    => (string)($pr['base']['ref'] ?? ''),
+            'updated' => (string)($pr['updated_at'] ?? ''),
+            'url'     => (string)($pr['html_url'] ?? ''),
+        ];
+        $out['sha']   = (string)($pr['head']['sha'] ?? '');
+        $out['label'] = "PR #{$n} \"{$out['pr']['title']}\" [{$out['pr']['state']}"
+                      . ($out['pr']['draft'] ? ', draft' : '') . "] "
+                      . "{$out['pr']['head']} -> {$out['pr']['base']} by {$out['pr']['author']}";
+        if ($out['sha'] === '') {
+            $out['error'] = "pull request #{$n} has no head commit (deleted branch?)";
+            $out['fatal'] = true;
+        }
+        return $out;
+    }
+
+    $out['ref']   = "refs/heads/{$config['branch']}";
+    $out['label'] = "branch {$config['branch']} of {$config['repo']}";
+
+    [$commit, $err] = gh_api("/repos/{$config['repo']}/commits/{$config['branch']}", $token);
+    if ($commit === null) {
+        // Not fatal: the branch zip is downloadable without the API, we just lose
+        // change detection, so ?check=1 will pull every time instead of skipping.
+        $out['error'] = "cannot read the head of {$config['branch']}: {$err} — "
+                      . "deploying the branch tip without change tracking";
+        return $out;
+    }
+    $out['sha']    = (string)($commit['sha'] ?? '');
+    $message       = (string)($commit['commit']['message'] ?? '');
+    $out['commit'] = [
+        'message' => trim(explode("\n", $message)[0]),
+        'author'  => (string)($commit['author']['login'] ?? ($commit['commit']['author']['name'] ?? '')),
+        'date'    => (string)($commit['commit']['author']['date'] ?? ''),
+        'url'     => (string)($commit['html_url'] ?? ''),
+    ];
+    return $out;
+}
+
+// The prefilled "create a fine-grained token" URL. Everything except the repository
+// picker can be set from the query string, so the user only ticks the repo itself.
+function pat_url(string $repo, bool $needsPullRequests): string {
+    $owner  = trim(explode('/', $repo)[0] ?? '');
+    $name   = substr('pull.php deploy ' . $repo, 0, 40); // GitHub caps the name at 40 chars
+    $params = [
+        'name'        => $name,
+        'description' => 'Read-only token for pull.php. Under "Repository access" pick '
+                       . ($repo !== '' ? $repo : 'the repository to deploy') . '.',
+        'expires_in'  => 'none',
+        'contents'    => 'read',
+        'metadata'    => 'read',
+    ];
+    if ($needsPullRequests) $params['pull_requests'] = 'read';
+    if ($owner !== '')      $params['target_name']   = $owner;
+    return PAT_NEW_URL . '?' . http_build_query($params);
+}
+
+// Shown wherever a download or an API call comes back 401/404.
+function token_hint_lines(array $config): array {
+    $needsPr = $config['source'] === 'pr';
+    return array_filter([
+        "hint: 401/404 usually means the token cannot see this repository.",
+        "  fine-grained PAT — needs 'Repository access' to include {$config['repo']},",
+        "    plus Contents: Read" . ($needsPr ? " and Pull requests: Read (for PR tracking)" : ""),
+        "  ready-made link (permissions preselected):",
+        "    " . pat_url($config['repo'], $needsPr),
+        "  classic PAT — needs the full 'repo' scope, not just 'public_repo'",
+        "  also check the token is neither expired nor revoked",
+    ]);
+}
+
+// JSON snapshot for the tracking screen and for anything else that wants to poll.
+function emit_status_json(array $config, string $token): void {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+
+    $track = resolve_target($config, $token);
+    $state = state_read();
+    $live  = (string)($state['sha'] ?? '');
+
+    echo json_encode([
+        'ok'            => $track['error'] === '',
+        'error'         => $track['error'],
+        'repo'          => $config['repo'],
+        'mode'          => $track['mode'],
+        'ref'           => $track['ref'],
+        'label'         => $track['label'],
+        'sha'           => $track['sha'],
+        'short'         => short_sha($track['sha']),
+        'commit'        => $track['commit'],
+        'pr'            => $track['pr'],
+        'deployed'      => $live,
+        'deployed_short'=> short_sha($live),
+        'deployed_at'   => (string)($state['at'] ?? ''),
+        'deployed_files'=> $state['files'] ?? null,
+        // Unknown head = cannot compare, so report "no change" rather than looping on pulls.
+        'changed'       => $track['sha'] !== '' && $track['sha'] !== $live,
+        'auto'          => $config['auto_pull'],
+        'interval'      => $config['auto_interval'],
+        'purge'         => $config['purge'],
+        'now'           => date('Y-m-d H:i:s'),
+        'tz'            => date_default_timezone_get(),
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+}
+
+// ---------- tracking screen ----------
+
+// Live view of "what is on GitHub vs. what is deployed". Polls ?status=1 and,
+// when auto-deploy is on, streams a pull as soon as the tracked head moves.
+function render_watch_page(array $config): void {
+    $h = function ($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); };
+    $cfg = json_encode([
+        'interval' => $config['auto_interval'],
+        'auto'     => $config['auto_pull'],
+    ], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">";
+    echo "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+    echo "<meta name=\"robots\" content=\"noindex,nofollow\">";
+    echo "<title>pull.php — tracking</title>";
+    echo terminal_css();
+    echo "</head><body><div class=\"term\"><div class=\"bar\">";
+    echo "<span class=\"dot r\"></span><span class=\"dot y\"></span><span class=\"dot g\"></span>";
+    echo "<span class=\"title\">pull.php — tracking " . $h($config['repo']) . "</span>";
+    echo "<a class=\"home\" href=\"/\" title=\"Go to site root\">⌂ site root</a></div>";
+
+    echo "<div class=\"panel\" id=\"panel\"><div class=\"mute\">connecting…</div></div>";
+
+    echo "<div class=\"ctl\">";
+    echo "<label class=\"chk\"><input id=\"auto\" type=\"checkbox\"" . ($config['auto_pull'] ? ' checked' : '') . ">";
+    echo "<span class=\"t\">auto-deploy when the tracked head moves</span></label>";
+    echo "<button id=\"now\" class=\"btn\" type=\"button\">$ deploy_now</button>";
+    echo "<span class=\"mute\" id=\"tick\"></span>";
+    echo "</div>";
+
+    echo "<pre id=\"out\" class=\"out\"></pre></div>";
+    echo "<script>window.__watch = {$cfg};</script>";
+    echo watch_js();
+    echo "</body></html>";
 }
 
 // ---------- download / copy ----------
@@ -415,10 +757,15 @@ function cleanup(string $dir): void {
 // ---------- password gate ----------
 
 // Returns when the request is authorised; renders the unlock screen and exits otherwise.
-function require_auth(string $hash, bool $plain): void {
+// $mode is 'html' (unlock form), 'plain' (cron/curl) or 'json' (the ?status=1 poller).
+function require_auth(string $hash, string $mode): void {
     if (isset($_GET['logout'])) {
         auth_cookie_clear();
-        if ($plain) {
+        if ($mode === 'json') {
+            header('Content-Type: application/json; charset=utf-8');
+            exit(json_encode(['ok' => false, 'auth' => false, 'error' => 'logged out']));
+        }
+        if ($mode === 'plain') {
             header('Content-Type: text/plain; charset=utf-8');
             exit("logged out\n");
         }
@@ -447,7 +794,12 @@ function require_auth(string $hash, bool $plain): void {
     if ($supplied !== null) usleep(400000); // small brake on password guessing
 
     http_response_code(401);
-    if ($plain) {
+    if ($mode === 'json') {
+        header('Content-Type: application/json; charset=utf-8');
+        // The tracking screen reads this and stops polling instead of hammering the gate.
+        exit(json_encode(['ok' => false, 'auth' => false, 'error' => 'password required']));
+    }
+    if ($mode === 'plain') {
         header('Content-Type: text/plain; charset=utf-8');
         exit(($supplied !== null ? "unauthorized: wrong password\n" : "unauthorized: password required\n")
             . "hint: send it as a header, e.g.\n"
@@ -547,10 +899,29 @@ function handle_setup_post(string $configPath): void {
     $keepRaw  = (string)($_POST['keep_files'] ?? '');
     $password = (string)($_POST['password'] ?? '');
     $purge    = isset($_POST['purge']);
+    $prRaw    = trim((string)($_POST['pr_number'] ?? ''));
+    $autoPull = isset($_POST['auto_pull']);
+    $intRaw   = trim((string)($_POST['auto_interval'] ?? ''));
 
     $errors = [];
     if ($password !== '' && strlen($password) < 6) {
         $errors[] = 'password must be at least 6 characters (or empty for no password)';
+    }
+    $prNumber = (int)$prRaw;
+    if ($prRaw !== '' && !preg_match('~^[0-9]+$~', $prRaw)) {
+        $errors[] = 'pull request must be a number (e.g. 42), or empty to track the branch';
+    } elseif ($prRaw !== '' && $prNumber < 1) {
+        $errors[] = 'pull request number must be 1 or greater';
+    }
+    // An empty PR field means branch tracking — that is the pre-existing behaviour.
+    $source = $prNumber > 0 ? 'pr' : 'branch';
+    // GITHUB_TOKEN from the environment counts too — it wins over the config value.
+    if ($source === 'pr' && $ghToken === '' && (string)(getenv('GITHUB_TOKEN') ?: '') === '') {
+        $errors[] = 'pull request tracking needs a token with Pull requests: Read — use the link above to create one';
+    }
+    $interval = $intRaw === '' ? AUTO_INTERVAL_DEF : (int)$intRaw;
+    if ($interval < AUTO_INTERVAL_MIN) {
+        $errors[] = 'check interval must be at least ' . AUTO_INTERVAL_MIN . ' seconds';
     }
     if ($repo === '' || !preg_match('~^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$~', $repo)) {
         $errors[] = 'repo must look like "owner/name"';
@@ -575,6 +946,7 @@ function handle_setup_post(string $configPath): void {
             'repo' => $repo, 'branch' => $branch, 'subdir' => $subdir,
             'gh_token' => $ghToken, 'purge' => $purge,
             'timezone' => $timezone, 'keep_files' => implode(', ', $keepFiles),
+            'pr_number' => $prRaw, 'auto_pull' => $autoPull, 'auto_interval' => $interval,
         ], $errors);
         return;
     }
@@ -588,6 +960,10 @@ function handle_setup_post(string $configPath): void {
         'timezone'      => $timezone,
         'password_hash' => $password !== '' ? password_hash($password, PASSWORD_DEFAULT) : '',
         'purge'         => $purge,
+        'source'        => $source,
+        'pr_number'     => $prNumber,
+        'auto_pull'     => $autoPull,
+        'auto_interval' => $interval,
     ];
 
     $body = "<?php\n"
@@ -600,6 +976,7 @@ function handle_setup_post(string $configPath): void {
             'repo' => $repo, 'branch' => $branch, 'subdir' => $subdir,
             'gh_token' => $ghToken, 'purge' => $purge,
             'timezone' => $timezone, 'keep_files' => implode(', ', $keepFiles),
+            'pr_number' => $prRaw, 'auto_pull' => $autoPull, 'auto_interval' => $interval,
         ], ['cannot write pull-config.php — check directory permissions']);
         return;
     }
@@ -616,8 +993,11 @@ function render_setup_form(array $values = [], array $errors = []): void {
     $ghToken  = $h($values['gh_token'] ?? '');
     $timezone = $h($values['timezone'] ?? 'UTC');
     $keep     = $h($values['keep_files'] ?? 'pull.php, pull-config.php');
+    $prNumber = $h($values['pr_number'] ?? '');
+    $interval = $h($values['auto_interval'] ?? AUTO_INTERVAL_DEF);
     // Password is never echoed back into the form; purge defaults to on for new installs.
     $purge    = (bool)($values['purge'] ?? true);
+    $autoPull = (bool)($values['auto_pull'] ?? true);
 
     header('Content-Type: text/html; charset=utf-8');
     echo "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">";
@@ -645,7 +1025,10 @@ function render_setup_form(array $values = [], array $errors = []): void {
         foreach ($errors as $e) $intro[] = ['e', '!   - ' . $e];
         $intro[] = ['', ''];
     }
-    $introJson = htmlspecialchars(json_encode($intro), ENT_QUOTES, 'UTF-8');
+    // htmlspecialchars would be wrong here: a <script> body is raw text, so &quot;
+    // never gets decoded and the whole block dies with a syntax error. The JSON_HEX_*
+    // flags escape the same characters in a way that stays valid JavaScript.
+    $introJson = json_encode($intro, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
 
     echo "<form id=\"setup\" method=\"post\" class=\"form hidden\">";
     echo "<input type=\"hidden\" name=\"_setup\" value=\"1\">";
@@ -669,6 +1052,17 @@ function render_setup_form(array $values = [], array $errors = []): void {
     );
 
     setup_field(
+        'pr_number', 'Pull request to track',
+        $prNumber, 'e.g. 42 — leave empty to track the branch', false,
+        [
+            'Leave empty to deploy the branch above. Enter a number to deploy the <strong>head commit of that pull request</strong> instead, so the change can be looked at on a real server before it is merged.',
+            'Where to get it: the number in the pull request URL — <code>github.com/&lt;owner&gt;/&lt;name&gt;/pull/<strong>42</strong></code>.',
+            'The head of a pull request is read through the GitHub API, so the token below needs <strong>Pull requests: Read</strong> on top of Contents: Read. The button on the token field adds it for you as soon as this field is filled in.',
+            'Merging the pull request freezes its head — from then on it keeps deploying the same commit. Clear <code>pr_number</code> in <code>pull-config.php</code> to go back to the branch.',
+        ]
+    );
+
+    setup_field(
         'subdir', 'Subdirectory in the repo',
         $subdir, '.', false,
         [
@@ -681,16 +1075,12 @@ function render_setup_form(array $values = [], array $errors = []): void {
         'gh_token', 'GitHub Personal Access Token',
         $ghToken, 'github_pat_... or ghp_...', true,
         [
-            '<strong>Required for private repos.</strong> Public repos: leave empty.',
-            'Where to create — <em>fine-grained PAT</em> (recommended):',
-            '&nbsp;&nbsp;1. Open <code>github.com/settings/personal-access-tokens/new</code>',
-            '&nbsp;&nbsp;2. Repository access &rarr; "Only select repositories" &rarr; pick this repo',
-            '&nbsp;&nbsp;3. Repository permissions &rarr; <strong>Contents: Read</strong>',
-            '&nbsp;&nbsp;4. Generate, copy the <code>github_pat_...</code> string, paste it here.',
-            'Where to create — <em>classic PAT</em>:',
-            '&nbsp;&nbsp;1. Open <code>github.com/settings/tokens/new</code>',
-            '&nbsp;&nbsp;2. Tick the full <code>repo</code> scope (not just <code>public_repo</code>)',
-            '&nbsp;&nbsp;3. Generate, copy the <code>ghp_...</code> string, paste it here.',
+            '<strong>Required for private repos and for pull request tracking.</strong> A public repo deployed by branch needs no token.',
+            '<a class="patbtn" id="patbtn" target="_blank" rel="noopener" href="' . htmlspecialchars(pat_url('', false), ENT_QUOTES, 'UTF-8') . '">$ create_fine_grained_token &#8599;</a>',
+            '<span class="perms" id="patperms"></span>',
+            'The link opens GitHub&rsquo;s token form with the name, description, lifetime and permissions already filled in — it follows the repository and pull request fields above, so fill those in first.',
+            'One thing the link cannot preselect: on that page choose <strong>Repository access &rarr; Only select repositories</strong> and tick your repository. Then press <em>Generate token</em> and paste the <code>github_pat_...</code> string here — GitHub shows it only once.',
+            'Prefer a classic token? <a href="' . PAT_CLASSIC_URL . '" target="_blank" rel="noopener">this link</a> preselects the full <code>repo</code> scope (<code>public_repo</code> alone is not enough).',
         ]
     );
 
@@ -723,6 +1113,26 @@ function render_setup_form(array $values = [], array $errors = []): void {
             'The unlock screen offers <strong>&laquo;remember me&raquo;</strong>: a signed cookie valid 30 days, so you are not asked again on this browser. Unchecked, it lasts only until the browser closes.',
             'From cron, send it as a header instead: <code>curl -H "X-Pull-Password: ..." "https://host/pull.php?plain=1"</code>.',
             'Leave empty to keep the deploy open to anyone who knows the URL.',
+        ]
+    );
+
+    setup_check(
+        'auto_pull', 'Track the ref and deploy on its own when it moves',
+        $autoPull,
+        [
+            'Adds the tracking screen at <code>pull.php?watch=1</code>: it keeps comparing the deployed commit with the head on GitHub and starts a deploy the moment a new commit shows up. It runs for as long as that page stays open.',
+            'For an unattended server use cron instead: <code>curl -s "https://host/pull.php?check=1&amp;plain=1"</code>. With <code>check=1</code> nothing is downloaded while the commit has not changed.',
+            'The commit that is currently live is written to <code>pull-state.json</code> next to this script — that file is what makes &laquo;deploy only what changed&raquo; possible, and it is never overwritten by a pull.',
+            'Off: nothing happens on its own, the tracking screen still works but only deploys when you press the button.',
+        ]
+    );
+
+    setup_field(
+        'auto_interval', 'Check interval, seconds',
+        $interval, '60', false,
+        [
+            'How often the tracking screen asks GitHub for the current head commit. Minimum ' . AUTO_INTERVAL_MIN . ' seconds.',
+            'One check is one API request. A token is allowed 5000 requests per hour, so 60 seconds (60 per hour) leaves plenty of room.',
         ]
     );
 
@@ -791,10 +1201,19 @@ function render_setup_done(array $config): void {
     echo "  subdir:   " . $h($config['subdir']) . "\n";
     echo "  timezone: " . $h($config['timezone']) . "\n";
     echo "  password: " . ($config['password_hash'] !== '' ? "set (asked before every pull)" : "not set (anyone with the URL can deploy)") . "\n";
-    echo "  purge:    " . ($config['purge'] ? "on — files missing from the repo are deleted, irreversibly" : "off — obsolete files stay in place") . "\n\n";
+    echo "  purge:    " . ($config['purge'] ? "on — files missing from the repo are deleted, irreversibly" : "off — obsolete files stay in place") . "\n";
+    echo "  tracking: " . ($config['source'] === 'pr'
+        ? "pull request #" . $h($config['pr_number']) . " (its head commit is deployed)"
+        : "branch " . $h($config['branch'])) . "\n";
+    echo "  auto:     " . ($config['auto_pull']
+        ? "on — the tracking screen deploys a new commit within " . $h($config['auto_interval']) . "s"
+        : "off — deploys only when you ask for one") . "\n\n";
+    echo "# tracking screen:  pull.php?watch=1\n";
+    echo "# deploy if changed: curl -s \"https://host/pull.php?check=1&plain=1\"   (for cron)\n";
     echo "# delete pull-config.php to re-run setup.\n";
     echo "</pre>";
     echo "<a class=\"btn\" href=\"pull.php\">$ run_pull_now</a>";
+    echo "<a class=\"btn\" href=\"pull.php?watch=1\">$ open_tracking</a>";
     echo "</div></body></html>";
 }
 
@@ -842,6 +1261,7 @@ html,body{margin:0;padding:0;background:var(--bg2);color:var(--fg);
 .fld .prompt{color:var(--cyan);margin-right:6px}
 .fld .help{color:var(--mute);font-size:12.5px;margin:2px 0 8px;padding-left:18px}
 .fld .help code{background:#1a1a1a;padding:1px 6px;border-radius:3px;color:#d7d7d7}
+.fld .help a{color:var(--cyan)}
 .fld input,.fld textarea{
   width:100%;background:#1a1a1a;color:var(--fg);
   border:1px solid #4a4a4a;border-radius:4px;
@@ -863,8 +1283,202 @@ html,body{margin:0;padding:0;background:var(--bg2);color:var(--fg);
   border:1px solid var(--accent);border-radius:4px;
   font:inherit;cursor:pointer;text-decoration:none}
 .btn:hover{background:var(--accent);color:#1a1a1a}
+.btn:disabled{opacity:.45;cursor:default}
+.btn:disabled:hover{background:#1a1a1a;color:var(--accent)}
+.bar .home + .home{margin-left:8px}
+.mute{color:var(--mute)}
+/* prefilled token link in the setup form */
+.help .patbtn{display:inline-block;margin:8px 0 2px;padding:7px 13px;
+  background:#1a1a1a;color:var(--accent);border:1px solid var(--accent);
+  border-radius:4px;text-decoration:none;font-size:12.5px}
+.help .patbtn:hover{background:var(--accent);color:#1a1a1a}
+.help .perms{display:block;color:var(--yellow);margin-top:4px}
+/* tracking screen */
+.panel{padding:14px 20px;background:#262626;border-bottom:1px solid #3a3a3a}
+.panel .row{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:2px 0}
+.panel .k{flex:0 0 92px;color:var(--mute)}
+.panel .v{flex:1 1 240px;word-break:break-word}
+.panel .v a{color:var(--cyan)}
+.panel .is-ok{color:var(--green)}
+.panel .is-warn{color:var(--yellow)}
+.panel .is-err{color:var(--red)}
+.ctl{display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+  padding:12px 20px;border-bottom:1px solid #3a3a3a}
+.ctl .btn{margin:0;padding:7px 14px}
+.ctl .chk{margin:0;font-size:13px}
+.panel ~ .out{max-height:55vh;overflow:auto}
 </style>
 CSS;
+}
+
+function watch_js(): string {
+    return <<<'JS'
+<script>
+(function(){
+  const cfg    = window.__watch || {interval: 60, auto: false};
+  const panel  = document.getElementById('panel');
+  const out    = document.getElementById('out');
+  const autoEl = document.getElementById('auto');
+  const nowEl  = document.getElementById('now');
+  const tickEl = document.getElementById('tick');
+  const every  = Math.max(15, cfg.interval | 0);
+  let running = false, left = 0, lastSha = null;
+
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+  function line(text, cls){
+    const n = document.createElement('span');
+    n.className = 'line' + (cls || '');
+    n.textContent = text;
+    out.appendChild(n);
+    out.appendChild(document.createTextNode('\n'));
+    out.scrollTop = out.scrollHeight;
+  }
+
+  function classify(t){
+    const s = t.trim();
+    if (!s) return '';
+    if (/^(error:|!)/.test(s))            return ' is-err';
+    if (s.startsWith('warning:'))         return ' is-err';
+    if (/^(purge:|deleted|DELETED:)/.test(s)) return ' is-warn';
+    if (s.startsWith('#'))                return ' is-cmt';
+    if (s.startsWith('==='))              return ' is-cmd';
+    if (/^(START|END|STATUS|DURATION|FILES|COMMIT|tracking|head|check):/.test(s)) return ' is-info';
+    return '';
+  }
+
+  function row(k, v, cls){
+    return '<div class="row"><span class="k">' + esc(k) + '</span>' +
+           '<span class="v' + (cls || '') + '">' + v + '</span></div>';
+  }
+
+  function render(s){
+    if (s.auth === false){
+      panel.innerHTML = row('status', '<span class="is-err">session expired — reload and unlock</span>');
+      return false;
+    }
+    let head = esc(s.short);
+    if (s.pr){
+      head += ' — ' + esc(s.pr.title || '');
+    } else if (s.commit){
+      head += ' — ' + esc(s.commit.message || '');
+    }
+
+    let badge, cls;
+    if (s.error)           { badge = 'error';            cls = ' is-err'; }
+    else if (!s.deployed)  { badge = 'never deployed';   cls = ' is-warn'; }
+    else if (s.changed)    { badge = 'new commit ahead'; cls = ' is-warn'; }
+    else                   { badge = 'up to date';       cls = ' is-ok'; }
+
+    let target;
+    if (s.pr){
+      const meta = '[' + esc(s.pr.state) + (s.pr.draft ? ', draft' : '') + '] ' +
+                   esc(s.pr.head) + ' &rarr; ' + esc(s.pr.base) + ' by ' + esc(s.pr.author);
+      target = (s.pr.url ? '<a href="' + esc(s.pr.url) + '" target="_blank" rel="noopener">PR #' + esc(s.pr.number) + '</a>'
+                         : 'PR #' + esc(s.pr.number)) + ' ' + meta;
+    } else {
+      target = 'branch ' + esc(String(s.ref || '').replace('refs/heads/', ''));
+    }
+
+    panel.innerHTML =
+      row('state',    esc(badge), cls) +
+      row('repo',     esc(s.repo)) +
+      row('tracking', target) +
+      row('head',     head) +
+      row('deployed', s.deployed
+            ? esc(s.deployed_short) + ' <span class="mute">at ' + esc(s.deployed_at) + '</span>'
+            : '<span class="mute">nothing deployed from here yet</span>') +
+      (s.error ? row('note', esc(s.error), ' is-err') : '') +
+      row('checked',  esc(s.now) + ' <span class="mute">(' + esc(s.tz) + ')</span>');
+
+    // Announce a moving head once, so the log reads as a timeline rather than a poll dump.
+    if (s.sha && lastSha && s.sha !== lastSha){
+      line('head moved: ' + lastSha.slice(0,7) + ' -> ' + s.sha.slice(0,7), ' is-warn');
+    }
+    if (s.sha) lastSha = s.sha;
+    return true;
+  }
+
+  async function poll(){
+    let res;
+    try {
+      res = await fetch('?status=1&_=' + Date.now(), {cache:'no-store', headers:{'Accept':'application/json'}});
+    } catch (e){
+      line('status check failed: ' + e.message, ' is-err');
+      return null;
+    }
+    let data;
+    try { data = await res.json(); }
+    catch (e){ line('status check returned no JSON (HTTP ' + res.status + ')', ' is-err'); return null; }
+    render(data);
+    return data;
+  }
+
+  async function deploy(reason){
+    if (running) return;
+    running = true;
+    nowEl.disabled = true;
+    line('');
+    line('$ pull.php — ' + reason, ' is-cmd');
+    try {
+      const res = await fetch('?plain=1&_=' + Date.now(), {cache:'no-store'});
+      if (res.status === 401){
+        line('unauthorized — reload the page and unlock', ' is-err');
+      } else if (res.body && res.body.getReader){
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        for (;;){
+          const {value, done} = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, {stream:true});
+          let i;
+          while ((i = buf.indexOf('\n')) >= 0){
+            const t = buf.slice(0, i);
+            buf = buf.slice(i + 1);
+            line(t, classify(t));
+          }
+        }
+        if (buf) line(buf, classify(buf));
+      } else {
+        // Older browsers: no streaming, so show the whole run once it finishes.
+        (await res.text()).split('\n').forEach(t => line(t, classify(t)));
+      }
+    } catch (e){
+      line('deploy request failed: ' + e.message, ' is-err');
+    }
+    running = false;
+    nowEl.disabled = false;
+    await poll();
+  }
+
+  async function cycle(){
+    const s = await poll();
+    if (s && s.changed && autoEl.checked && !running){
+      await deploy('auto-deploy: tracked head moved');
+    }
+    left = every;
+  }
+
+  nowEl.addEventListener('click', () => deploy('manual deploy'));
+  autoEl.addEventListener('change', () => {
+    line(autoEl.checked ? 'auto-deploy: on' : 'auto-deploy: off (this browser tab only)', ' is-cmt');
+    if (autoEl.checked) cycle();
+  });
+
+  setInterval(() => {
+    tickEl.textContent = running
+      ? 'deploying…'
+      : 'next check in ' + Math.max(0, left) + 's';
+    if (--left <= 0 && !running) cycle();
+  }, 1000);
+
+  line('$ watching every ' + every + 's — auto-deploy is ' + (autoEl.checked ? 'on' : 'off'), ' is-cmd');
+  cycle();
+})();
+</script>
+JS;
 }
 
 function terminal_js(bool $isForm = false): string {
@@ -905,6 +1519,42 @@ function terminal_js(bool $isForm = false): string {
     const first = form.querySelector('input,textarea');
     if (first) first.focus();
   }
+
+  // Keep the "create a token" link in step with what this deploy will actually need:
+  // the owner comes from the repo field, Pull requests: Read appears once a PR is tracked.
+  const patBtn   = document.getElementById('patbtn');
+  const patPerms = document.getElementById('patperms');
+  const val = id => ((document.getElementById(id) || {}).value || '').trim();
+
+  function syncPat(){
+    if (!patBtn) return;
+    const repo  = val('f_repo');
+    const pr    = val('f_pr_number');
+    const owner = repo.split('/')[0].trim();
+    const p = new URLSearchParams();
+    p.set('name', ('pull.php deploy ' + repo).trim().slice(0, 40));
+    p.set('description', 'Read-only token for pull.php. Under "Repository access" pick ' +
+      (repo || 'the repository to deploy') + '.');
+    p.set('expires_in', 'none');
+    p.set('contents', 'read');
+    p.set('metadata', 'read');
+    if (pr)    p.set('pull_requests', 'read');
+    if (owner) p.set('target_name', owner);
+    patBtn.href = 'https://github.com/settings/personal-access-tokens/new?' + p.toString();
+
+    if (patPerms){
+      patPerms.textContent = 'Preselects Contents: Read + Metadata: Read' +
+        (pr ? ', plus Pull requests: Read (to follow PR #' + pr + ')' : '') +
+        (owner ? '. Resource owner: ' + owner + '.'
+               : '. Fill in the repository above and the owner gets preselected too.');
+    }
+  }
+  ['f_repo', 'f_pr_number'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', syncPat);
+  });
+  syncPat();
+
   run();
 })();
 </script>
