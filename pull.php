@@ -273,9 +273,13 @@ if ($src === null) {
 $keep = array_values(array_unique(array_merge(ALWAYS_KEEP, $config['keep_files'])));
 term("copying into {$target} (preserving: " . implode(', ', $keep) . ")");
 $copied = 0;
-copyTree($src, $target, $keep, $copied);
+$failed = [];
+copyTree($src, $target, $keep, $copied, $failed);
 
-term("copied {$copied} files");
+term("copied {$copied} changed files (unchanged ones are left as they are)");
+if ($failed) {
+    term("warning: " . count($failed) . " files could not be written, e.g. " . $failed[0]);
+}
 
 // Purge runs only after a successful copy, so a failed download never deletes anything.
 $deleted = null;
@@ -923,8 +927,17 @@ function download(string $url, string $dest, array $extraHeaders = []): array {
     return [$size, $size > 0 ? '' : 'empty file'];
 }
 
-function copyTree(string $from, string $to, array $keepTopLevel, int &$copied): void {
-    if (!is_dir($to) && !mkdir($to, 0755, true) && !is_dir($to)) return;
+// The site is being served while this runs, so a file is never rewritten in place:
+// copy() truncates first, and a request in between gets half of it (a half app.js
+// is a page that never loads). Each file is written next to its target and renamed
+// over it; a file whose bytes already match is left alone, so its mtime — the
+// browser's cache key — survives a deploy that did not change it.
+// $failed collects the files that could not be written.
+function copyTree(string $from, string $to, array $keepTopLevel, int &$copied, array &$failed): void {
+    if (!is_dir($to) && !@mkdir($to, 0755, true) && !is_dir($to)) {
+        $failed[] = $to . '/';
+        return;
+    }
     foreach (new DirectoryIterator($from) as $f) {
         if ($f->isDot()) continue;
         $name = $f->getFilename();
@@ -932,12 +945,46 @@ function copyTree(string $from, string $to, array $keepTopLevel, int &$copied): 
         $s = $f->getPathname();
         $d = $to . '/' . $name;
         if ($f->isDir()) {
-            copyTree($s, $d, [], $copied);
-        } else {
-            @copy($s, $d);
-            $copied++;
+            copyTree($s, $d, [], $copied, $failed);
+            continue;
         }
+        if (sameContent($s, $d)) continue;
+        // A link the operator made is written through, as always: renaming over it
+        // would replace the link itself with a plain file.
+        $ok = is_link($d) ? @copy($s, $d) : replaceFile($s, $d);
+        if ($ok) $copied++;
+        else $failed[] = $d;
     }
+}
+
+function sameContent(string $a, string $b): bool {
+    return is_file($b) && @filesize($a) === @filesize($b)
+        && @hash_file('sha1', $a) === @hash_file('sha1', $b);
+}
+
+// Swaps $dst for a copy of $src in one rename() — atomic on one filesystem, so a
+// reader sees the old file or the new one, never a partial one.
+function replaceFile(string $src, string $dst): bool {
+    static $pending = '';   // the temp file being written right now
+    static $armed = false;
+    if (!$armed) {
+        $armed = true;
+        // A time limit hit mid-copy still runs this: no half-written leftovers.
+        register_shutdown_function(function () use (&$pending) {
+            if ($pending !== '') @unlink($pending);
+        });
+    }
+    $pending = dirname($dst) . '/.' . basename($dst) . '.pull-' . getmypid();
+    $ok = @copy($src, $pending);
+    // copy() over an existing file kept its mode; a renamed-in file must keep it too.
+    if ($ok && is_file($dst)) @chmod($pending, fileperms($dst) & 0777);
+    if ($ok && @rename($pending, $dst)) {
+        $pending = '';
+        return true;
+    }
+    @unlink($pending);
+    $pending = '';
+    return @copy($src, $dst);   // a host that refuses the temp file or rename: the old way
 }
 
 // Mirror mode: delete everything in $dst that has no counterpart in $src.
