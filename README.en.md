@@ -85,9 +85,10 @@ Honest limits:
   push the artifacts to a separate branch and point `pull.php` at that branch.
 - **A large repo or frequent deploys** — every run downloads the whole branch
   archive; there is no incremental transfer.
-- **You need atomic deploys, rollback, DB migrations, zero downtime** — during
-  the copy the site is briefly in an in-between state. Use Deployer,
-  Capistrano or real CI for that.
+- **You need a whole-deploy atomic switch, DB migrations, zero downtime** —
+  every file is replaced atomically, but the set is not: during the copy some
+  files are already new and some still old. Use Deployer, Capistrano or real CI
+  for that.
 - **The host has SSH and git** — then `git pull` is simpler, faster and more
   honest.
 
@@ -104,13 +105,19 @@ Honest limits:
 3. Unpacks it into a temp directory (`sys_get_temp_dir()`).
 4. Locates the configured subdirectory (`subdir`) inside the archive.
 5. Copies its contents over the script's directory, skipping the preserve list.
+   A file is never rewritten in place: the new version is written next to it and
+   renamed over the old one, so a request in the middle of a deploy gets the old
+   file or the new one, never half of it. Files that did not change are not
+   touched at all — their modification time (the browser's cache key) survives
+   the deploy.
 6. If mirror mode is on, deletes everything in the directory that is no longer
    in the repository.
 7. Writes the deployed commit to `pull-state.json` — that is how you can tell
    what is live, how "deploy only what changed" works, and where the versions
    offered for rollback come from.
 8. Cleans up temp files and prints a summary banner: status, start and end time,
-   duration, the commit, files copied and files deleted.
+   duration, the commit, files changed and files deleted. Files that could not
+   be written are reported on a `warning:` line.
 
 ## Requirements
 
@@ -252,7 +259,7 @@ here too (as the `X-Pull-Password` header); without it you get a `401` and
 ## Rolling back to an earlier version
 
 Every deploy is appended to a log inside `pull-state.json`: the commit, where it
-came from (a branch or a PR), the date, and how many files were copied. The
+came from (a branch or a PR), the date, and how many files changed. The
 `pull.php?history=1` screen shows that log as a list of versions — each version
 once, dated by its most recent deploy.
 
@@ -475,8 +482,15 @@ rather than in the status code — in scripts, read the `STATUS:` line at the en
 - **`keep_files` only applies at the top level.** Nested paths
   (`assets/config.json`) are not protected — inside subfolders everything is
   both copied and deleted.
-- **The deploy is not atomic.** While files are being copied the site is briefly
-  in an in-between state.
+- **The deploy is atomic per file, not as a whole.** No file is ever visible
+  half-written: it goes to a temporary `.<name>.pull-<pid>` next to itself and is
+  renamed over, keeping the old file's mode. But while the copy runs, some files
+  are already new and some still old. Where the host refuses the rename, the
+  file is copied over in place, as before. A symlink in the site directory stays
+  a symlink — the file is written through it.
+- **`pull.php` does not update itself.** It is always on the preserve list: a new
+  version of the script is uploaded by hand over the old one, and
+  `pull-config.php` and `pull-state.json` stay as they are.
 - **Hosting limits.** The script asks for `set_time_limit(300)` and sets
   `ignore_user_abort(true)`, but hard hosting limits can still cut a large
   repository off mid-run.
