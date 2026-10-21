@@ -1,4 +1,12 @@
 <?php
+// Parse-safe bootstrap: older PHP versions must report requirements, not a syntax error.
+if (PHP_VERSION_ID < 70400) {
+    if (!headers_sent()) http_response_code(503);
+    echo '<!doctype html><meta charset="utf-8"><h1>Обновите PHP на хостинге</h1><p>Требуется PHP 7.4 или новее; рекомендуется 8.1+. Сейчас: ' . htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8') . '</p><p>Сервер: ' . htmlspecialchars(isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : 'версия не раскрывается', ENT_QUOTES, 'UTF-8') . '</p><p>Попросите хостинг переключить PHP и включить zip и cURL. Для .htaccess нужен Apache 2.4+, для nginx — аналогичные запреты доступа.</p>';
+    exit;
+}
+$neurosaas_engine = <<<'NEUROSAAS_ENGINE_20'
+<?php
 // careerhack.ru/pull.php
 // Pulls a subdirectory from a GitHub repo and overwrites the directory this file lives in.
 // Configuration lives in ./pull-config.php (next to this file). Delete pull-config.php to re-run setup.
@@ -41,6 +49,7 @@ const AUTH_COOKIE       = 'pull_auth';
 const AUTH_REMEMBER_TTL = 2592000; // "remember me" cookie lifetime: 30 days
 const AUTH_SESSION_TTL  = 43200;   // without "remember me": 12 hours, session cookie
 
+if (defined('PULL_LIBRARY_ONLY')) return;
 $configPath = __DIR__ . '/' . CONFIG_FILE;
 $plain      = isset($_GET['plain']);
 
@@ -1969,3 +1978,6 @@ JS;
 </script>
 JS;
 }
+
+NEUROSAAS_ENGINE_20;
+eval(substr($neurosaas_engine, 5));
